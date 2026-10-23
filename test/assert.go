@@ -2,6 +2,7 @@ package test
 
 import (
 	"fmt"
+	"net/netip"
 	"reflect"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 
 // AssertDeepCopyEqual checks to see if two variables have the same values but DO NOT share any memory
 // There is currently a special case for `time.loc` (as this code traverses into unexported fields)
-func AssertDeepCopyEqual(t *testing.T, a interface{}, b interface{}) {
+func AssertDeepCopyEqual(t *testing.T, a any, b any) {
 	v1 := reflect.ValueOf(a)
 	v2 := reflect.ValueOf(b)
 
@@ -24,6 +25,11 @@ func AssertDeepCopyEqual(t *testing.T, a interface{}, b interface{}) {
 }
 
 func traverseDeepCopy(t *testing.T, v1 reflect.Value, v2 reflect.Value, name string) bool {
+	if v1.Type() == v2.Type() && v1.Type() == reflect.TypeFor[netip.Addr]() {
+		// Ignore netip.Addr types since they reuse an interned global value
+		return false
+	}
+
 	switch v1.Kind() {
 	case reflect.Array:
 		for i := 0; i < v1.Len(); i++ {
@@ -66,7 +72,7 @@ func traverseDeepCopy(t *testing.T, v1 reflect.Value, v2 reflect.Value, name str
 		}
 		return traverseDeepCopy(t, v1.Elem(), v2.Elem(), name)
 
-	case reflect.Ptr:
+	case reflect.Pointer:
 		local := reflect.ValueOf(time.Local).Pointer()
 		if local == v1.Pointer() && local == v2.Pointer() {
 			return true

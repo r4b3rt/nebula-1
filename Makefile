@@ -1,20 +1,14 @@
-GOMINVERSION = 1.17
 NEBULA_CMD_PATH = "./cmd/nebula"
-GO111MODULE = on
-export GO111MODULE
 CGO_ENABLED = 0
 export CGO_ENABLED
 
 # Set up OS specific bits
 ifeq ($(OS),Windows_NT)
-	#TODO: we should be able to ditch awk as well
-	GOVERSION := $(shell go version | awk "{print substr($$3, 3)}")
-	GOISMIN := $(shell IF "$(GOVERSION)" GEQ "$(GOMINVERSION)" ECHO 1)
 	NEBULA_CMD_SUFFIX = .exe
 	NULL_FILE = nul
+	# RIO on windows does pointer stuff that makes go vet angry
+	VET_FLAGS = -unsafeptr=false
 else
-	GOVERSION := $(shell go version | awk '{print substr($$3, 3)}')
-	GOISMIN := $(shell expr "$(GOVERSION)" ">=" "$(GOMINVERSION)")
 	NEBULA_CMD_SUFFIX =
 	NULL_FILE = /dev/null
 endif
@@ -27,6 +21,9 @@ ifndef BUILD_NUMBER
 		BUILD_NUMBER = $(shell git describe --exact-match --dirty | cut -dv -f2)
 	endif
 endif
+
+DOCKER_IMAGE_REPO ?= nebulaoss/nebula
+DOCKER_IMAGE_TAG ?= latest
 
 LDFLAGS = -X main.Build=$(BUILD_NUMBER)
 
@@ -42,18 +39,54 @@ ALL_LINUX = linux-amd64 \
 	linux-mips64 \
 	linux-mips64le \
 	linux-mips-softfloat \
-	linux-riscv64
+	linux-riscv64 \
+	linux-loong64
+
+ALL_FREEBSD = freebsd-amd64 \
+	freebsd-arm64
+
+ALL_OPENBSD = openbsd-amd64 \
+	openbsd-arm64
+
+ALL_NETBSD = netbsd-amd64 \
+ 	netbsd-arm64
 
 ALL = $(ALL_LINUX) \
+	$(ALL_FREEBSD) \
+	$(ALL_OPENBSD) \
+	$(ALL_NETBSD) \
 	darwin-amd64 \
 	darwin-arm64 \
-	freebsd-amd64 \
-	windows-amd64
+	windows-amd64 \
+	windows-arm64
+
+# Cross-build shards used by .github/workflows/test.yml — same as ALL_*
+# but with the arch that has a native CI runner removed, so the cross-build
+# job is not duplicating coverage the native test jobs already give.
+ALL_CROSS_LINUX = $(filter-out linux-amd64,$(ALL_LINUX))
+
+# ALL_CROSS_LINUX further split into family sub-shards so each can run on
+# its own CI runner in parallel. Union of the three must equal
+# ALL_CROSS_LINUX; adding a new linux arch goes into the matching family.
+ALL_CROSS_LINUX_ARM   = linux-arm-5 linux-arm-6 linux-arm-7 linux-arm64
+ALL_CROSS_LINUX_MIPS  = linux-mips linux-mipsle linux-mips64 linux-mips64le linux-mips-softfloat
+ALL_CROSS_LINUX_OTHER = linux-386 linux-ppc64le linux-riscv64 linux-loong64
+
+# Based on section 2.2 of the Go Cryptographic Module CVMP Security Policy #5247
+ALL_FIPS140 = linux-amd64-fips140 \
+	linux-arm64-fips140 \
+	windows-amd64-fips140 \
+	windows-arm64-fips140 \
+	darwin-arm64-fips140 \
+	freebsd-amd64-fips140 \
+	linux-arm-7-fips140 \
+	linux-mips64-fips140 \
+	linux-ppc64le-fips140
 
 e2e:
 	$(TEST_ENV) go test -tags=e2e_testing -count=1 $(TEST_FLAGS) ./e2e
 
-e2ev: TEST_FLAGS = -v
+e2ev: TEST_FLAGS += -v
 e2ev: e2e
 
 e2evv: TEST_ENV += TEST_LOGS=1
@@ -65,17 +98,64 @@ e2evvv: e2ev
 e2evvvv: TEST_ENV += TEST_LOGS=3
 e2evvvv: e2ev
 
+e2e-bench: TEST_FLAGS = -bench=. -benchmem -run=^$
+e2e-bench: e2e
+
+DOCKER_BIN = build/linux-amd64/nebula build/linux-amd64/nebula-cert
+
 all: $(ALL:%=build/%/nebula) $(ALL:%=build/%/nebula-cert)
+
+all-linux: $(ALL_LINUX:%=build/%/nebula) $(ALL_LINUX:%=build/%/nebula-cert)
+
+all-freebsd: $(ALL_FREEBSD:%=build/%/nebula) $(ALL_FREEBSD:%=build/%/nebula-cert)
+
+all-openbsd: $(ALL_OPENBSD:%=build/%/nebula) $(ALL_OPENBSD:%=build/%/nebula-cert)
+
+all-netbsd: $(ALL_NETBSD:%=build/%/nebula) $(ALL_NETBSD:%=build/%/nebula-cert)
+
+all-darwin: build/darwin-amd64/nebula build/darwin-amd64/nebula-cert build/darwin-arm64/nebula build/darwin-arm64/nebula-cert
+
+all-windows: build/windows-amd64/nebula.exe build/windows-amd64/nebula-cert.exe build/windows-arm64/nebula.exe build/windows-arm64/nebula-cert.exe
+
+# CI cross-build shards. darwin-arm64 is covered by the native macos-latest
+# job; windows-amd64 is covered by the native windows-latest job; both are
+# omitted here to avoid building them a second time. darwin-amd64 stays in
+# all-cross-darwin because intel mac is only a labeled/master-time native
+# job, so PRs still need cross-build coverage for it.
+all-cross-linux: $(ALL_CROSS_LINUX:%=build/%/nebula) $(ALL_CROSS_LINUX:%=build/%/nebula-cert)
+
+all-cross-linux-arm:   $(ALL_CROSS_LINUX_ARM:%=build/%/nebula)   $(ALL_CROSS_LINUX_ARM:%=build/%/nebula-cert)
+
+all-cross-linux-mips:  $(ALL_CROSS_LINUX_MIPS:%=build/%/nebula)  $(ALL_CROSS_LINUX_MIPS:%=build/%/nebula-cert)
+
+all-cross-linux-other: $(ALL_CROSS_LINUX_OTHER:%=build/%/nebula) $(ALL_CROSS_LINUX_OTHER:%=build/%/nebula-cert)
+
+all-cross-darwin: build/darwin-amd64/nebula build/darwin-amd64/nebula-cert
+
+all-cross-windows: build/windows-arm64/nebula.exe build/windows-arm64/nebula-cert.exe
+
+docker: docker/linux-$(shell go env GOARCH)
 
 release: $(ALL:%=build/nebula-%.tar.gz)
 
 release-linux: $(ALL_LINUX:%=build/nebula-%.tar.gz)
 
-release-freebsd: build/nebula-freebsd-amd64.tar.gz
+release-freebsd: $(ALL_FREEBSD:%=build/nebula-%.tar.gz)
 
-BUILD_ARGS = -trimpath
+release-openbsd: $(ALL_OPENBSD:%=build/nebula-%.tar.gz)
+
+release-netbsd: $(ALL_NETBSD:%=build/nebula-%.tar.gz)
+
+release-boringcrypto: build/nebula-linux-$(shell go env GOARCH)-boringcrypto.tar.gz
+
+release-fips140: $(ALL_FIPS140:%=build/nebula-%.tar.gz)
+
+BUILD_ARGS += -trimpath
 
 bin-windows: build/windows-amd64/nebula.exe build/windows-amd64/nebula-cert.exe
+	mv $? .
+
+bin-windows-arm64: build/windows-arm64/nebula.exe build/windows-arm64/nebula-cert.exe
 	mv $? .
 
 bin-darwin: build/darwin-amd64/nebula build/darwin-amd64/nebula-cert
@@ -84,19 +164,45 @@ bin-darwin: build/darwin-amd64/nebula build/darwin-amd64/nebula-cert
 bin-freebsd: build/freebsd-amd64/nebula build/freebsd-amd64/nebula-cert
 	mv $? .
 
+bin-freebsd-arm64: build/freebsd-arm64/nebula build/freebsd-arm64/nebula-cert
+	mv $? .
+
+bin-boringcrypto: build/linux-$(shell go env GOARCH)-boringcrypto/nebula build/linux-$(shell go env GOARCH)-boringcrypto/nebula-cert
+	mv $? .
+
+bin-fips140: build/linux-$(shell go env GOARCH)-fips140/nebula build/linux-$(shell go env GOARCH)-fips140/nebula-cert
+	mv $? .
+
+bin-pkcs11: BUILD_ARGS += -tags pkcs11
+bin-pkcs11: CGO_ENABLED = 1
+bin-pkcs11: bin
+
+# Build with the pprof debug server (serves on :6060). See startPprofServer.
+debug: BUILD_ARGS += -tags debug
+debug: bin
+
 bin:
-	go build $(BUILD_ARGS) -ldflags "$(LDFLAGS)" -o ./nebula${NEBULA_CMD_SUFFIX} ${NEBULA_CMD_PATH}
-	go build $(BUILD_ARGS) -ldflags "$(LDFLAGS)" -o ./nebula-cert${NEBULA_CMD_SUFFIX} ./cmd/nebula-cert
+	$(GOENV) go build $(BUILD_ARGS) -ldflags "$(LDFLAGS)" -o ./nebula${NEBULA_CMD_SUFFIX} ${NEBULA_CMD_PATH}
+	$(GOENV) go build $(BUILD_ARGS) -ldflags "$(LDFLAGS)" -o ./nebula-cert${NEBULA_CMD_SUFFIX} ./cmd/nebula-cert
 
 install:
-	go install $(BUILD_ARGS) -ldflags "$(LDFLAGS)" ${NEBULA_CMD_PATH}
-	go install $(BUILD_ARGS) -ldflags "$(LDFLAGS)" ./cmd/nebula-cert
+	$(GOENV) go install $(BUILD_ARGS) -ldflags "$(LDFLAGS)" ${NEBULA_CMD_PATH}
+	$(GOENV) go install $(BUILD_ARGS) -ldflags "$(LDFLAGS)" ./cmd/nebula-cert
 
 build/linux-arm-%: GOENV += GOARM=$(word 3, $(subst -, ,$*))
 build/linux-mips-%: GOENV += GOMIPS=$(word 3, $(subst -, ,$*))
 
 # Build an extra small binary for mips-softfloat
 build/linux-mips-softfloat/%: LDFLAGS += -s -w
+
+# boringcrypto
+build/linux-amd64-boringcrypto/%: GOENV += GOEXPERIMENT=boringcrypto CGO_ENABLED=1
+build/linux-arm64-boringcrypto/%: GOENV += GOEXPERIMENT=boringcrypto CGO_ENABLED=1
+
+# fips140
+FIPSVERSION = v1.0.0
+$(foreach _rule, $(ALL_FIPS140), build/$(_rule)/%): GOENV += GOFIPS140=$(FIPSVERSION)
+$(foreach _rule, $(ALL_FIPS140), build/$(_rule)/%): BUILD_ARGS += -tags fips140enforce
 
 build/%/nebula: .FORCE
 	GOOS=$(firstword $(subst -, , $*)) \
@@ -120,15 +226,30 @@ build/nebula-%.tar.gz: build/%/nebula build/%/nebula-cert
 build/nebula-%.zip: build/%/nebula.exe build/%/nebula-cert.exe
 	cd build/$* && zip ../nebula-$*.zip nebula.exe nebula-cert.exe
 
+docker/%: build/%/nebula build/%/nebula-cert
+	docker build . $(DOCKER_BUILD_ARGS) -f docker/Dockerfile --platform "$(subst -,/,$*)" --tag "${DOCKER_IMAGE_REPO}:${DOCKER_IMAGE_TAG}" --tag "${DOCKER_IMAGE_REPO}:$(BUILD_NUMBER)"
+
 vet:
-	go vet -v ./...
+	go vet $(VET_FLAGS) -v ./...
 
 test:
-	go test -v ./...
+	$(TEST_ENV) go test $(TEST_FLAGS) -v ./...
+
+test-pkcs11:
+	CGO_ENABLED=1 go test -v -tags pkcs11 ./...
 
 test-cov-html:
 	go test -coverprofile=coverage.out
 	go tool cover -html=coverage.out
+
+# The package builds only compile. The final line links an android binary so a linker-only failure
+# cannot pass CI.
+build-test-mobile:
+	GOARCH=amd64 GOOS=ios go build $(shell go list ./... | grep -v '/cmd/\|/examples/')
+	GOARCH=arm64 GOOS=ios go build $(shell go list ./... | grep -v '/cmd/\|/examples/')
+	GOARCH=amd64 GOOS=android go build $(shell go list ./... | grep -v '/cmd/\|/examples/')
+	GOARCH=arm64 GOOS=android go build $(shell go list ./... | grep -v '/cmd/\|/examples/')
+	GOARCH=arm64 GOOS=android go build -o /dev/null ${NEBULA_CMD_PATH}
 
 bench:
 	go test -bench=.
@@ -141,7 +262,7 @@ bench-cpu-long:
 	go test -bench=. -benchtime=60s -cpuprofile=cpu.pprof
 	go tool pprof go-audit.test cpu.pprof
 
-proto: nebula.pb.go cert/cert.pb.go
+proto: nebula.pb.go cert/cert_v1.pb.go
 
 nebula.pb.go: nebula.proto .FORCE
 	go build github.com/gogo/protobuf/protoc-gen-gogofaster
@@ -158,15 +279,75 @@ ifeq ($(words $(MAKECMDGOALS)),1)
 	@$(MAKE) service ${.DEFAULT_GOAL} --no-print-directory
 endif
 
+# Useful to chain together, like:
+# - make fips140 e2evv
+# - make fips140 smoke-docker
+# Use `release-fips140` to build release binaries
+fips140:
+	@echo > $(NULL_FILE)
+ifeq ($(strip $(GOFIPS140)),)
+	$(eval GOFIPS140 = $(FIPSVERSION))
+endif
+	$(eval GOENV += GOFIPS140=$(GOFIPS140))
+	$(eval BUILD_ARGS += -tags fips140enforce)
+	$(eval TEST_ENV += $(GOENV))
+	$(eval CURVE = P256)
+ifeq ($(words $(MAKECMDGOALS)),1)
+	@$(MAKE) fips140 GOFIPS140=$(GOFIPS140) ${.DEFAULT_GOAL} --no-print-directory
+endif
+
+# To test the future pending module, use like `make fips140-latest test`
+ALL_GOFIPS140 = v1.0.0 v1.26.0 latest
+define FIPS140_rule
+fips140-$(1): GOFIPS140 = $(1)
+fips140-$(1): fips140
+endef
+$(foreach _rule, $(ALL_GOFIPS140), $(eval $(call FIPS140_rule,$(_rule))))
+
+# Iterate and run the goals for all fips versions, like `make fips140-all GOALS=test`
+fips140-all:
+	@$(foreach _v,$(ALL_GOFIPS140),$(MAKE) fips140-$(_v) $(GOALS) &&) true
+
+# Useful to chain together, like:
+# - make boringcrypto e2evv
+# - make boringcrypto smoke-docker
+# Use `release-boringcrypto` or `bin-boringcrypto` to build release binaries
+boringcrypto:
+	@echo > $(NULL_FILE)
+	$(eval GOENV += GOEXPERIMENT=boringcrypto CGO_ENABLED=1)
+	$(eval TEST_ENV += $(GOENV))
+	$(eval CURVE = P256)
+ifeq ($(words $(MAKECMDGOALS)),1)
+	@$(MAKE) boringcrypto ${.DEFAULT_GOAL} --no-print-directory
+endif
+
 bin-docker: bin build/linux-amd64/nebula build/linux-amd64/nebula-cert
 
+smoke-docker: BUILD_ARGS += -race
+smoke-docker: GOENV += CGO_ENABLED=1
 smoke-docker: bin-docker
-	cd .github/workflows/smoke/ && ./build.sh
-	cd .github/workflows/smoke/ && ./smoke.sh
+	# This is so we can limit `fips140` smoke test to just P256 curve.
+	if [ "$(CURVE)" != "P256" ]; then cd .github/workflows/smoke/ && $(GOENV) ./build.sh; fi
+	if [ "$(CURVE)" != "P256" ]; then cd .github/workflows/smoke/ && $(GOENV) ./smoke.sh; fi
+	cd .github/workflows/smoke/ && $(GOENV) NAME="smoke-p256" CURVE="P256" ./build.sh
+	cd .github/workflows/smoke/ && $(GOENV) NAME="smoke-p256" ./smoke.sh
 
-smoke-docker-race: BUILD_ARGS = -race
-smoke-docker-race: smoke-docker
+smoke-relay-docker: BUILD_ARGS += -race
+smoke-relay-docker: GOENV += CGO_ENABLED=1
+smoke-relay-docker: bin-docker
+	cd .github/workflows/smoke/ && $(GOENV) ./build-relay.sh
+	cd .github/workflows/smoke/ && $(GOENV) ./smoke-relay.sh
+
+smoke-docker-ipv6: export SMOKE_OVERLAY_IPV6 = 1
+smoke-docker-ipv6: smoke-docker
+
+smoke-self: bin
+	cd .github/workflows/smoke/ && ./smoke-self.sh
+
+smoke-vagrant/%: bin-docker build/%/nebula
+	cd .github/workflows/smoke/ && ./build.sh $*
+	cd .github/workflows/smoke/ && ./smoke-vagrant.sh $*
 
 .FORCE:
-.PHONY: e2e e2ev e2evv e2evvv e2evvvv test test-cov-html bench bench-cpu bench-cpu-long bin proto release service smoke-docker smoke-docker-race
+.PHONY: all all-linux all-freebsd all-openbsd all-netbsd all-darwin all-windows all-cross-linux all-cross-linux-arm all-cross-linux-mips all-cross-linux-other all-cross-darwin all-cross-windows bench bench-cpu bench-cpu-long bin bin-windows bin-windows-arm64 bin-darwin bin-freebsd bin-freebsd-arm64 bin-boringcrypto bin-fips140 bin-pkcs11 bin-docker boringcrypto build-test-mobile debug docker e2e e2ev e2evv e2evvv e2evvvv e2e-bench fips140 fips140-all $(ALL_GOFIPS140:%=fips140-%) install proto release release-linux release-freebsd release-openbsd release-netbsd release-boringcrypto release-fips140 service smoke-docker smoke-relay-docker smoke-docker-ipv6 smoke-self test test-pkcs11 test-cov-html vet smoke-vagrant/%
 .DEFAULT_GOAL := bin

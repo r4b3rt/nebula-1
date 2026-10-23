@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"log/slog"
+	"maps"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,24 +17,31 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/imdario/mergo"
-	"github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
+	"dario.cat/mergo"
+	"go.yaml.in/yaml/v3"
 )
 
 type C struct {
 	path        string
 	files       []string
-	Settings    map[interface{}]interface{}
-	oldSettings map[interface{}]interface{}
-	callbacks   []func(*C)
-	l           *logrus.Logger
+	Settings    map[string]any
+	oldSettings map[string]any
+	callbacks   []func(*C, *Reload)
+	l           *slog.Logger
 	reloadLock  sync.Mutex
+
+	// Set by the first reload that needs a restart and never cleared. Guarded by reloadLock
+	needsRestart bool
+
+	// callbackLock guards callbacks. Registration is not confined to startup: CatchHUP is
+	// running from inside Main, and anything wired up after Main returns registers while
+	// a HUP could already be reloading, so append and iteration have to be serialized.
+	callbackLock sync.Mutex
 }
 
-func NewC(l *logrus.Logger) *C {
+func NewC(l *slog.Logger) *C {
 	return &C{
-		Settings: make(map[interface{}]interface{}),
+		Settings: make(map[string]any),
 		l:        l,
 	}
 }
@@ -71,9 +80,43 @@ func (c *C) LoadString(raw string) error {
 // RegisterReloadCallback stores a function to be called when a config reload is triggered. The functions registered
 // here should decide if they need to make a change to the current process before making the change. HasChanged can be
 // used to help decide if a change is necessary.
-// These functions should return quickly or spawn their own go routine if they will take a while
-func (c *C) RegisterReloadCallback(f func(*C)) {
+// These functions should return quickly or spawn their own go routine if they will take a while.
+// Use r to report anything that failed or needs a restart to apply.
+func (c *C) RegisterReloadCallback(f func(c *C, r *Reload)) {
+	c.callbackLock.Lock()
+	defer c.callbackLock.Unlock()
 	c.callbacks = append(c.callbacks, f)
+}
+
+// reloadCallbacks returns a snapshot of the registered callbacks. Reloads iterate the
+// snapshot rather than the live slice, so a registration from another goroutine cannot
+// race the loop; a callback registered while a reload is in progress runs from the next
+// reload on. callbackLock is not held during the calls themselves, so a callback that
+// registers another callback does not deadlock.
+func (c *C) reloadCallbacks() []func(*C, *Reload) {
+	c.callbackLock.Lock()
+	defer c.callbackLock.Unlock()
+	return append(make([]func(*C, *Reload), 0, len(c.callbacks)), c.callbacks...)
+}
+
+// InitialLoad returns true if this is the first load of the config, and ReloadConfig has not been called yet.
+func (c *C) InitialLoad() bool {
+	return c.oldSettings == nil
+}
+
+// Render returns keys and their values as yaml, for a subsystem to remember what it applied. Empty means they couldn't
+// be rendered and should never match.
+func (c *C) Render(keys ...string) string {
+	m := make(map[string]any, len(keys))
+	for _, k := range keys {
+		m[k] = c.Get(k)
+	}
+	b, err := yaml.Marshal(m)
+	if err != nil {
+		c.l.Debug("Failed to render config", "keys", keys, "error", err)
+		return ""
+	}
+	return string(b)
 }
 
 // HasChanged checks if the underlying structure of the provided key has changed after a config reload. The value of
@@ -87,8 +130,8 @@ func (c *C) HasChanged(k string) bool {
 	}
 
 	var (
-		nv interface{}
-		ov interface{}
+		nv any
+		ov any
 	)
 
 	if k == "" {
@@ -102,12 +145,18 @@ func (c *C) HasChanged(k string) bool {
 
 	newVals, err := yaml.Marshal(nv)
 	if err != nil {
-		c.l.WithField("config_path", k).WithError(err).Error("Error while marshaling new config")
+		c.l.Error("Error while marshaling new config",
+			"config_path", k,
+			"error", err,
+		)
 	}
 
 	oldVals, err := yaml.Marshal(ov)
 	if err != nil {
-		c.l.WithField("config_path", k).WithError(err).Error("Error while marshaling old config")
+		c.l.Error("Error while marshaling old config",
+			"config_path", k,
+			"error", err,
+		)
 	}
 
 	return string(newVals) != string(oldVals)
@@ -116,6 +165,10 @@ func (c *C) HasChanged(k string) bool {
 // CatchHUP will listen for the HUP signal in a go routine and reload all configs found in the
 // original path provided to Load. The old settings are shallow copied for change detection after the reload.
 func (c *C) CatchHUP(ctx context.Context) {
+	if c.path == "" {
+		return
+	}
+
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
 
@@ -128,51 +181,55 @@ func (c *C) CatchHUP(ctx context.Context) {
 				return
 			case <-ch:
 				c.l.Info("Caught HUP, reloading config")
-				c.ReloadConfig()
+				c.ReloadConfig().Log(c.l)
 			}
 		}
 	}()
 }
 
-func (c *C) ReloadConfig() {
+// ReloadConfig reloads the config from the path provided to Load and runs every registered callback. A config that
+// fails to load is logged here, like any other failure, and the result carries the error for the summary.
+func (c *C) ReloadConfig() ReloadResult {
 	c.reloadLock.Lock()
 	defer c.reloadLock.Unlock()
 
-	c.oldSettings = make(map[interface{}]interface{})
-	for k, v := range c.Settings {
-		c.oldSettings[k] = v
+	c.oldSettings = make(map[string]any)
+	maps.Copy(c.oldSettings, c.Settings)
+
+	if err := c.Load(c.path); err != nil {
+		c.l.Error("Error occurred while reloading config", "config_path", c.path, "error", err)
+		return ReloadResult{Err: err, RestartRequired: c.needsRestart}
 	}
 
-	err := c.Load(c.path)
-	if err != nil {
-		c.l.WithField("config_path", c.path).WithError(err).Error("Error occurred while reloading config")
-		return
-	}
-
-	for _, v := range c.callbacks {
-		v(c)
-	}
+	return c.runCallbacks()
 }
 
-func (c *C) ReloadConfigString(raw string) error {
+// ReloadConfigString is ReloadConfig for a config held in memory rather than on disk.
+func (c *C) ReloadConfigString(raw string) ReloadResult {
 	c.reloadLock.Lock()
 	defer c.reloadLock.Unlock()
 
-	c.oldSettings = make(map[interface{}]interface{})
-	for k, v := range c.Settings {
-		c.oldSettings[k] = v
+	c.oldSettings = make(map[string]any)
+	maps.Copy(c.oldSettings, c.Settings)
+
+	if err := c.LoadString(raw); err != nil {
+		c.l.Error("Error occurred while reloading config", "error", err)
+		return ReloadResult{Err: err, RestartRequired: c.needsRestart}
 	}
 
-	err := c.LoadString(raw)
-	if err != nil {
-		return err
+	return c.runCallbacks()
+}
+
+func (c *C) runCallbacks() ReloadResult {
+	r := &Reload{c: c}
+	for _, v := range c.reloadCallbacks() {
+		v(c, r)
 	}
 
-	for _, v := range c.callbacks {
-		v(c)
+	if r.restart {
+		c.needsRestart = true
 	}
-
-	return nil
+	return ReloadResult{Failed: r.failed, RestartRequired: c.needsRestart, RestartKeys: r.keys}
 }
 
 // GetString will get the string for k or return the default d if not found or invalid
@@ -192,13 +249,13 @@ func (c *C) GetStringSlice(k string, d []string) []string {
 		return d
 	}
 
-	rv, ok := r.([]interface{})
+	rv, ok := r.([]any)
 	if !ok {
 		return d
 	}
 
 	v := make([]string, len(rv))
-	for i := 0; i < len(v); i++ {
+	for i := range v {
 		v[i] = fmt.Sprintf("%v", rv[i])
 	}
 
@@ -206,13 +263,13 @@ func (c *C) GetStringSlice(k string, d []string) []string {
 }
 
 // GetMap will get the map for k or return the default d if not found or invalid
-func (c *C) GetMap(k string, d map[interface{}]interface{}) map[interface{}]interface{} {
+func (c *C) GetMap(k string, d map[string]any) map[string]any {
 	r := c.Get(k)
 	if r == nil {
 		return d
 	}
 
-	v, ok := r.(map[interface{}]interface{})
+	v, ok := r.(map[string]any)
 	if !ok {
 		return d
 	}
@@ -229,6 +286,15 @@ func (c *C) GetInt(k string, d int) int {
 	}
 
 	return v
+}
+
+// GetUint32 will get the uint32 for k or return the default d if not found or invalid
+func (c *C) GetUint32(k string, d uint32) uint32 {
+	r := c.GetInt(k, int(d))
+	if r < 0 || uint64(r) > uint64(math.MaxUint32) {
+		return d
+	}
+	return uint32(r)
 }
 
 // GetBool will get the bool for k or return the default d if not found or invalid
@@ -248,6 +314,22 @@ func (c *C) GetBool(k string, d bool) bool {
 	return v
 }
 
+func AsBool(v any) (value bool, ok bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		switch x {
+		case "y", "yes":
+			return true, true
+		case "n", "no":
+			return false, true
+		}
+	}
+
+	return false, false
+}
+
 // GetDuration will get the duration for k or return the default d if not found or invalid
 func (c *C) GetDuration(k string, d time.Duration) time.Duration {
 	r := c.GetString(k, "")
@@ -258,7 +340,7 @@ func (c *C) GetDuration(k string, d time.Duration) time.Duration {
 	return v
 }
 
-func (c *C) Get(k string) interface{} {
+func (c *C) Get(k string) any {
 	return c.get(k, c.Settings)
 }
 
@@ -266,10 +348,10 @@ func (c *C) IsSet(k string) bool {
 	return c.get(k, c.Settings) != nil
 }
 
-func (c *C) get(k string, v interface{}) interface{} {
-	parts := strings.Split(k, ".")
-	for _, p := range parts {
-		m, ok := v.(map[interface{}]interface{})
+func (c *C) get(k string, v any) any {
+	parts := strings.SplitSeq(k, ".")
+	for p := range parts {
+		m, ok := v.(map[string]any)
 		if !ok {
 			return nil
 		}
@@ -328,7 +410,7 @@ func (c *C) addFile(path string, direct bool) error {
 }
 
 func (c *C) parseRaw(b []byte) error {
-	var m map[interface{}]interface{}
+	var m map[string]any
 
 	err := yaml.Unmarshal(b, &m)
 	if err != nil {
@@ -340,18 +422,18 @@ func (c *C) parseRaw(b []byte) error {
 }
 
 func (c *C) parse() error {
-	var m map[interface{}]interface{}
+	var m map[string]any
 
 	for _, path := range c.files {
-		b, err := ioutil.ReadFile(path)
+		b, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
 
-		var nm map[interface{}]interface{}
+		var nm map[string]any
 		err = yaml.Unmarshal(b, &nm)
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", path, err)
 		}
 
 		// We need to use WithAppendSlice so that firewall rules in separate

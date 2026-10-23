@@ -19,11 +19,16 @@ import (
 // |-----------------------------------------------------------------------|
 // |                               payload...                              |
 
-type m map[string]interface{}
+type m = map[string]any
 
 const (
 	Version uint8 = 1
 	Len           = 16
+
+	// MaxOverhead is the most a payload grows on its way to the underlay.
+	// A relayed packet has two headers and two AEAD tags, one for the inner tunnel and another for the relay tunnel.
+	// Every supported cipher (today) has a 16 byte tag.
+	MaxOverhead = 2 * (Len + 16)
 )
 
 type MessageType uint8
@@ -36,6 +41,7 @@ const (
 	LightHouse  MessageType = 3
 	Test        MessageType = 4
 	CloseTunnel MessageType = 5
+	Control     MessageType = 6
 )
 
 var typeMap = map[MessageType]string{
@@ -45,7 +51,13 @@ var typeMap = map[MessageType]string{
 	LightHouse:  "lightHouse",
 	Test:        "test",
 	CloseTunnel: "closeTunnel",
+	Control:     "control",
 }
+
+const (
+	MessageNone  MessageSubType = 0
+	MessageRelay MessageSubType = 1
+)
 
 const (
 	TestRequest MessageSubType = 0
@@ -67,7 +79,10 @@ var subTypeTestMap = map[MessageSubType]string{
 var subTypeNoneMap = map[MessageSubType]string{0: "none"}
 
 var subTypeMap = map[MessageType]*map[MessageSubType]string{
-	Message:     &subTypeNoneMap,
+	Message: {
+		MessageNone:  "none",
+		MessageRelay: "relay",
+	},
 	RecvError:   &subTypeNoneMap,
 	LightHouse:  &subTypeNoneMap,
 	Test:        &subTypeTestMap,
@@ -75,6 +90,7 @@ var subTypeMap = map[MessageType]*map[MessageSubType]string{
 	Handshake: {
 		HandshakeIXPSK0: "ix_psk0",
 	},
+	Control: &subTypeNoneMap,
 }
 
 type H struct {
@@ -163,6 +179,10 @@ func (h *H) SubTypeName() string {
 	return SubTypeName(h.Type, h.Subtype)
 }
 
+func (h *H) IsValidSubType() bool {
+	return IsValidSubType(h.Type, h.Subtype)
+}
+
 // SubTypeName will transform a nebula message sub type into a human string
 func SubTypeName(t MessageType, s MessageSubType) string {
 	if n, ok := subTypeMap[t]; ok {
@@ -172,6 +192,21 @@ func SubTypeName(t MessageType, s MessageSubType) string {
 	}
 
 	return "unknown"
+}
+
+func IsValidSubType(t MessageType, s MessageSubType) bool {
+	switch t {
+	case Message:
+		return s == MessageNone || s == MessageRelay
+	case Handshake:
+		return s == HandshakeIXPSK0
+	case Test:
+		return s == TestReply || s == TestRequest
+	case Control, CloseTunnel, RecvError, LightHouse:
+		return s == 0
+	default:
+		return false
+	}
 }
 
 // NewHeader turns bytes into a header

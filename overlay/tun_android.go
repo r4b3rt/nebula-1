@@ -1,61 +1,102 @@
 //go:build !e2e_testing
-// +build !e2e_testing
 
 package overlay
 
 import (
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
+	"net/netip"
 	"os"
-	"runtime"
+	"sync/atomic"
 
-	"github.com/sirupsen/logrus"
-	"github.com/slackhq/nebula/iputil"
+	"github.com/gaissmai/bart"
+	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/overlay/tio"
+	"github.com/slackhq/nebula/routing"
+	"github.com/slackhq/nebula/util"
 )
 
 type tun struct {
 	io.ReadWriteCloser
-	fd   int
-	cidr *net.IPNet
-	l    *logrus.Logger
+	fd          int
+	vpnNetworks []netip.Prefix
+	Routes      atomic.Pointer[[]Route]
+	routeTree   atomic.Pointer[bart.Table[routing.Gateways]]
+	l           *slog.Logger
 }
 
-func newTunFromFd(l *logrus.Logger, deviceFd int, cidr *net.IPNet, _ int, routes []Route, _ int) (*tun, error) {
-	if len(routes) > 0 {
-		return nil, fmt.Errorf("routes are not supported in %s", runtime.GOOS)
-	}
-
+func newTunFromFd(c *config.C, l *slog.Logger, deviceFd int, vpnNetworks []netip.Prefix) (*tun, error) {
+	// XXX Android returns an fd in non-blocking mode which is necessary for shutdown to work properly.
+	// Be sure not to call file.Fd() as it will set the fd to blocking mode.
 	file := os.NewFile(uintptr(deviceFd), "/dev/net/tun")
 
-	return &tun{
+	t := &tun{
 		ReadWriteCloser: file,
-		fd:              int(file.Fd()),
-		cidr:            cidr,
+		fd:              deviceFd,
+		vpnNetworks:     vpnNetworks,
 		l:               l,
-	}, nil
+	}
+
+	err := t.reload(c, true, nil)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+
+	c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
+		err := t.reload(c, false, r)
+		if err != nil {
+			util.LogWithContextIfNeeded("failed to reload tun device", err, t.l)
+			r.Failed()
+		}
+	})
+
+	return t, nil
 }
 
-func newTun(_ *logrus.Logger, _ string, _ *net.IPNet, _ int, _ []Route, _ int, _ bool) (*tun, error) {
+func newTun(_ *config.C, _ *slog.Logger, _ []netip.Prefix, _ bool) (*tun, error) {
 	return nil, fmt.Errorf("newTun not supported in Android")
 }
 
-func (t *tun) RouteFor(iputil.VpnIp) iputil.VpnIp {
-	return 0
+func (t *tun) RoutesFor(ip netip.Addr) routing.Gateways {
+	r, _ := t.routeTree.Load().Lookup(ip)
+	return r
 }
 
-func (t tun) Activate() error {
+func (t *tun) Activate() error {
 	return nil
 }
 
-func (t *tun) Cidr() *net.IPNet {
-	return t.cidr
+func (t *tun) reload(c *config.C, initial bool, r *config.Reload) error {
+	change, routes, err := getAllRoutesFromConfig(t.l, c, t.vpnNetworks, initial)
+	if err != nil {
+		return err
+	}
+
+	if !initial && !change {
+		return nil
+	}
+
+	routeTree, err := makeRouteTree(t.l, routes, false)
+	if err != nil {
+		return err
+	}
+
+	// Teach nebula how to handle the routes
+	t.Routes.Store(&routes)
+	t.routeTree.Store(routeTree)
+	return nil
+}
+
+func (t *tun) Networks() []netip.Prefix {
+	return t.vpnNetworks
 }
 
 func (t *tun) Name() string {
 	return "android"
 }
 
-func (t *tun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
-	return nil, fmt.Errorf("TODO: multiqueue not implemented for android")
+func (t *tun) Queues(int) ([]tio.Queue, error) {
+	return []tio.Queue{tio.NewSingleQueue(t, defaultBatchBufSize)}, nil
 }

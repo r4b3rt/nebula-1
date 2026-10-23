@@ -1,17 +1,64 @@
 //go:build !e2e_testing
-// +build !e2e_testing
 
 package udp
 
-// Darwin support is primarily implemented in udp_generic, besides NewListenConfig
-
 import (
+	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/netip"
 	"syscall"
+	"unsafe"
 
+	"github.com/slackhq/nebula/config"
 	"golang.org/x/sys/unix"
 )
+
+type StdConn struct {
+	*net.UDPConn
+	isV4  bool
+	sysFd uintptr
+	l     *slog.Logger
+}
+
+var _ Conn = &StdConn{}
+
+func NewListener(l *slog.Logger, s Settings) (Conn, error) {
+	lc := NewListenConfig(s.Multi)
+	pc, err := lc.ListenPacket(context.TODO(), "udp", s.Listen.String())
+	if err != nil {
+		return nil, err
+	}
+
+	if uc, ok := pc.(*net.UDPConn); ok {
+		c := &StdConn{UDPConn: uc, l: l}
+
+		rc, err := uc.SyscallConn()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open udp socket: %w", err)
+		}
+
+		err = rc.Control(func(fd uintptr) {
+			c.sysFd = fd
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get udp fd: %w", err)
+		}
+
+		la, err := c.LocalAddr()
+		if err != nil {
+			return nil, err
+		}
+		c.isV4 = la.Addr().Is4()
+
+		return c, nil
+	}
+
+	return nil, fmt.Errorf("unexpected PacketConn: %T %#v", pc, pc)
+}
 
 func NewListenConfig(multi bool) net.ListenConfig {
 	return net.ListenConfig{
@@ -37,11 +84,135 @@ func NewListenConfig(multi bool) net.ListenConfig {
 	}
 }
 
-func (u *Conn) Rebind() error {
-	file, err := u.File()
-	if err != nil {
-		return err
+//go:linkname sendto golang.org/x/sys/unix.sendto
+//go:noescape
+func sendto(s int, buf []byte, flags int, to unsafe.Pointer, addrlen int32) (err error)
+
+func (u *StdConn) WriteTo(b []byte, ap netip.AddrPort) error {
+	var sa unsafe.Pointer
+	var addrLen int32
+
+	if u.isV4 {
+		if ap.Addr().Is6() {
+			return ErrInvalidIPv6RemoteForSocket
+		}
+
+		var rsa unix.RawSockaddrInet4
+		rsa.Family = unix.AF_INET
+		rsa.Addr = ap.Addr().As4()
+		binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&rsa.Port))[:], ap.Port())
+		sa = unsafe.Pointer(&rsa)
+		addrLen = syscall.SizeofSockaddrInet4
+	} else {
+		var rsa unix.RawSockaddrInet6
+		rsa.Family = unix.AF_INET6
+		rsa.Addr = ap.Addr().As16()
+		binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&rsa.Port))[:], ap.Port())
+		sa = unsafe.Pointer(&rsa)
+		addrLen = syscall.SizeofSockaddrInet6
 	}
 
-	return syscall.SetsockoptInt(int(file.Fd()), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, 0)
+	// Golang stdlib doesn't handle EAGAIN correctly in some situations so we do writes ourselves
+	// See https://github.com/golang/go/issues/73919
+	for {
+		//_, _, err := unix.Syscall6(unix.SYS_SENDTO, u.sysFd, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), 0, sa, addrLen)
+		err := sendto(int(u.sysFd), b, 0, sa, addrLen)
+		if err == nil {
+			// Written, get out before the error handling
+			return nil
+		}
+
+		if errors.Is(err, syscall.EINTR) {
+			// Write was interrupted, retry
+			continue
+		}
+
+		if errors.Is(err, syscall.EAGAIN) {
+			return &net.OpError{Op: "sendto", Err: unix.EWOULDBLOCK}
+		}
+
+		if errors.Is(err, syscall.EBADF) {
+			return net.ErrClosed
+		}
+
+		return &net.OpError{Op: "sendto", Err: err}
+	}
+}
+
+func (u *StdConn) WriteBatch(bufs [][]byte, addrs []netip.AddrPort) (int, error) {
+	// An un-sendable destination costs its own packet, never the ones behind it in the batch.
+	// TODO: WriteTo maps EWOULDBLOCK to an error, so a full send buffer
+	// silently drops the rest of a burst (linux blocks instead). Poll for
+	// writability on EAGAIN before giving up on the remainder.
+	written := 0
+	for i, b := range bufs {
+		if err := u.WriteTo(b, addrs[i]); err == nil {
+			written++
+		} else {
+			u.l.Debug("failed to write packet in batch", "udpAddr", addrs[i], "error", err)
+		}
+	}
+	return written, nil
+}
+
+func (u *StdConn) LocalAddr() (netip.AddrPort, error) {
+	a := u.UDPConn.LocalAddr()
+
+	switch v := a.(type) {
+	case *net.UDPAddr:
+		addr, ok := netip.AddrFromSlice(v.IP)
+		if !ok {
+			return netip.AddrPort{}, fmt.Errorf("LocalAddr returned invalid IP address: %s", v.IP)
+		}
+		return netip.AddrPortFrom(addr, uint16(v.Port)), nil
+
+	default:
+		return netip.AddrPort{}, fmt.Errorf("LocalAddr returned: %#v", a)
+	}
+}
+
+func (u *StdConn) ReloadConfig(c *config.C, r *config.Reload) {
+	// TODO
+}
+
+func NewUDPStatsEmitter(udpConns []Conn) func() {
+	// No UDP stats for non-linux
+	return func() {}
+}
+
+func (u *StdConn) ListenOut(r EncReader, flush func()) error {
+	buffer := make([]byte, MTU)
+
+	for {
+		// Just read one packet at a time
+		n, rua, err := u.ReadFromUDPAddrPort(buffer)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			u.l.Error("unexpected udp socket receive error", "error", err)
+			continue
+		}
+
+		r(netip.AddrPortFrom(rua.Addr().Unmap(), rua.Port()), buffer[:n:n])
+		flush()
+	}
+}
+
+func (u *StdConn) SupportsMultipleReaders() bool {
+	return false
+}
+
+// Rebind clears the interface the kernel scoped this socket to, so that sends are routed against the current
+// routing table instead of the interface we happened to be on when the socket was created. Darwin pins sockets
+// this way on its own, which is what strands us after the underlying network changes.
+func (u *StdConn) Rebind() error {
+	var err error
+	if u.isV4 {
+		err = syscall.SetsockoptInt(int(u.sysFd), syscall.IPPROTO_IP, syscall.IP_BOUND_IF, 0)
+	} else {
+		err = syscall.SetsockoptInt(int(u.sysFd), syscall.IPPROTO_IPV6, syscall.IPV6_BOUND_IF, 0)
+	}
+
+	return err
 }

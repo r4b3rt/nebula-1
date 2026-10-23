@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -41,33 +40,46 @@ func printCert(args []string, out io.Writer, errOut io.Writer) error {
 		return err
 	}
 
-	rawCert, err := ioutil.ReadFile(*pf.path)
+	var claims ioClaims
+	if err := reserveInputs(&claims, "path", *pf.path); err != nil {
+		return err
+	}
+	if err := reserveOutputs(&claims, "out-qr", *pf.outQRPath); err != nil {
+		return err
+	}
+
+	rawCert, err := readInput("path", *pf.path, &claims)
 	if err != nil {
 		return fmt.Errorf("unable to read cert; %s", err)
 	}
 
-	var c *cert.NebulaCertificate
+	// When the QR is going to stdout, suppress the human-readable text/json
+	// output so the binary stream is not contaminated.
+	qrToStdout := isStdio(*pf.outQRPath)
+
+	var c cert.Certificate
 	var qrBytes []byte
 	part := 0
 
+	var jsonCerts []cert.Certificate
+
 	for {
-		c, rawCert, err = cert.UnmarshalNebulaCertificateFromPEM(rawCert)
+		c, rawCert, err = cert.UnmarshalCertificateFromPEM(rawCert)
 		if err != nil {
 			return fmt.Errorf("error while unmarshaling cert: %s", err)
 		}
 
-		if *pf.json {
-			b, _ := json.Marshal(c)
-			out.Write(b)
-			out.Write([]byte("\n"))
-
-		} else {
-			out.Write([]byte(c.String()))
-			out.Write([]byte("\n"))
+		if !qrToStdout {
+			if *pf.json {
+				jsonCerts = append(jsonCerts, c)
+			} else {
+				_, _ = out.Write([]byte(c.String()))
+				_, _ = out.Write([]byte("\n"))
+			}
 		}
 
 		if *pf.outQRPath != "" {
-			b, err := c.MarshalToPEM()
+			b, err := c.MarshalPEM()
 			if err != nil {
 				return fmt.Errorf("error while marshalling cert to PEM: %s", err)
 			}
@@ -81,13 +93,19 @@ func printCert(args []string, out io.Writer, errOut io.Writer) error {
 		part++
 	}
 
+	if *pf.json && !qrToStdout {
+		b, _ := json.Marshal(jsonCerts)
+		_, _ = out.Write(b)
+		_, _ = out.Write([]byte("\n"))
+	}
+
 	if *pf.outQRPath != "" {
 		b, err := qrcode.Encode(string(qrBytes), qrcode.Medium, -5)
 		if err != nil {
 			return fmt.Errorf("error while generating qr code: %s", err)
 		}
 
-		err = ioutil.WriteFile(*pf.outQRPath, b, 0600)
+		err = writeOutput(*pf.outQRPath, b, 0600, out)
 		if err != nil {
 			return fmt.Errorf("error while writing out-qr: %s", err)
 		}
@@ -103,6 +121,7 @@ func printSummary() string {
 func printHelp(out io.Writer) {
 	pf := newPrintFlags()
 	out.Write([]byte("Usage of " + os.Args[0] + " " + printSummary() + "\n"))
+	out.Write([]byte(stdioHelpText))
 	pf.set.SetOutput(out)
 	pf.set.PrintDefaults()
 }

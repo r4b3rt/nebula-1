@@ -1,15 +1,19 @@
 //go:build !e2e_testing
-// +build !e2e_testing
 
 package udp
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
+
+func NewListener(l *slog.Logger, s Settings) (Conn, error) {
+	return NewGenericListener(l, s)
+}
 
 func NewListenConfig(multi bool) net.ListenConfig {
 	return net.ListenConfig{
@@ -34,6 +38,6 @@ func NewListenConfig(multi bool) net.ListenConfig {
 	}
 }
 
-func (u *Conn) Rebind() error {
+func (u *GenericConn) Rebind() error {
 	return nil
 }

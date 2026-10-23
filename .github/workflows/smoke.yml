@@ -18,31 +18,47 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-    - name: Set up Go 1.17
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.17
-      id: go
+    - uses: actions/checkout@v7
 
-    - name: Check out code into the Go module directory
-      uses: actions/checkout@v2
-
-    - uses: actions/cache@v2
+    - uses: actions/setup-go@v7
       with:
-        path: ~/go/pkg/mod
-        key: ${{ runner.os }}-go1.17-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go1.17-
+        go-version: '1.27'
+        check-latest: true
+
+    - name: Smoke Docker
+      run: make smoke-docker
+
+    - name: Smoke Docker IPv6 overlay
+      run: make smoke-docker-ipv6
+
+    - name: Smoke Relay Docker
+      run: make smoke-relay-docker
+
+    - name: Smoke Docker boringcrypto
+      run: make boringcrypto smoke-docker
+
+    - name: Smoke Docker fips140
+      run: make fips140-all GOALS=smoke-docker
+
+    timeout-minutes: 10
+
+  smoke-self:
+    name: Run self traffic smoke test on macOS
+    runs-on: macos-latest
+    steps:
+
+    - uses: actions/checkout@v7
+
+    - uses: actions/setup-go@v7
+      with:
+        go-version: '1.27'
+        check-latest: true
 
     - name: build
-      run: make bin-docker
+      run: make bin
 
-    - name: setup docker image
+    - name: run smoke-self
       working-directory: ./.github/workflows/smoke
-      run: ./build.sh
-
-    - name: run smoke
-      working-directory: ./.github/workflows/smoke
-      run: ./smoke.sh
+      run: ./smoke-self.sh
 
     timeout-minutes: 10

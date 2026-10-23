@@ -1,57 +1,82 @@
 package sshd
 
 import (
-	"fmt"
+	"errors"
+	"log/slog"
 	"sort"
 	"strings"
 
-	"github.com/anmitsu/go-shlex"
-	"github.com/armon/go-radix"
-	"github.com/sirupsen/logrus"
+	"github.com/slackhq/nebula/commands"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 type session struct {
-	l        *logrus.Entry
+	l        *slog.Logger
 	c        *ssh.ServerConn
-	term     *terminal.Terminal
-	commands *radix.Tree
-	exitChan chan bool
+	term     *term.Terminal
+	commands *commands.Registry
+	cancel   func()
 }
 
-func NewSession(commands *radix.Tree, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, l *logrus.Entry) *session {
+func NewSession(reg *commands.Registry, conn *ssh.ServerConn, chans <-chan ssh.NewChannel, cancel func(), l *slog.Logger) *session {
 	s := &session{
-		commands: radix.NewFromMap(commands.ToMap()),
+		commands: reg.Clone(),
 		l:        l,
 		c:        conn,
-		exitChan: make(chan bool),
+		cancel:   cancel,
 	}
+	s.commands.DefaultFormat = DefaultFormat
 
-	s.commands.Insert("logout", &Command{
-		Name:             "logout",
-		ShortDescription: "Ends the current session",
-		Callback: func(a interface{}, args []string, w StringWriter) error {
-			s.Close()
-			return nil
-		},
-	})
+	s.commands.Register(LogoutCommand(s.Close))
 
 	go s.handleChannels(chans)
 	return s
 }
 
+// LogoutCommand is the logout command a session registers on its clone of the registry,
+// with end as what it does. Exported so a test can serve what a session serves.
+func LogoutCommand(end func()) *commands.Command {
+	return &commands.Command{
+		Name:             commands.Logout,
+		ShortDescription: "Ends the current session",
+		Run: func(a any, args []string) (commands.Result, error) {
+			end()
+			return commands.Nothing(), nil
+		},
+	}
+}
+
+// DefaultFormat is what an ssh session renders when the operator gave neither -json nor
+// -pretty: text where a command has a human form, and compact JSON for the ones that
+// have none (print-tunnel, print-relays, query-lighthouse). It is ssh's policy, exported so a test
+// can dispatch through the same choice, and ssh's to change.
+func DefaultFormat(c *commands.Command, r commands.Result) commands.Format {
+	if !c.JSONOnly {
+		return commands.FormatText
+	}
+
+	// A JSON-only command's refusal ("No vpn address was provided") is a sentence for a
+	// person, so an outcome renders as text here; ssh users and scripts expect it.
+	if r.Value == nil {
+		return commands.FormatText
+	}
+
+	return commands.FormatJSON
+}
+
 func (s *session) handleChannels(chans <-chan ssh.NewChannel) {
+	defer s.Close()
 	for newChannel := range chans {
 		if newChannel.ChannelType() != "session" {
-			s.l.WithField("sshChannelType", newChannel.ChannelType()).Error("unknown channel type")
+			s.l.Error("unknown channel type", "sshChannelType", newChannel.ChannelType())
 			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
 		}
 
 		channel, requests, err := newChannel.Accept()
 		if err != nil {
-			s.l.WithError(err).Warn("could not accept channel")
+			s.l.Warn("could not accept channel", "error", err)
 			continue
 		}
 
@@ -62,7 +87,6 @@ func (s *session) handleChannels(chans <-chan ssh.NewChannel) {
 func (s *session) handleRequests(in <-chan *ssh.Request, channel ssh.Channel) {
 	for req := range in {
 		var err error
-		//TODO: maybe support window sizing?
 		switch req.Type {
 		case "shell":
 			if s.term == nil {
@@ -87,35 +111,35 @@ func (s *session) handleRequests(in <-chan *ssh.Request, channel ssh.Channel) {
 			}
 
 			req.Reply(true, nil)
-			s.dispatchCommand(payload.Value, &stringWriter{channel})
+			err := s.dispatchCommand(payload.Value, commands.MergedOutput(channel))
 
-			//TODO: Fix error handling and report the proper status back
+			// A command that failed exits 1, so `ssh host cmd` callers can tell.
 			status := struct{ Status uint32 }{uint32(0)}
-			//TODO: I think this is how we shut down a shell as well?
+			if err != nil {
+				status.Status = 1
+			}
 			channel.SendRequest("exit-status", false, ssh.Marshal(status))
 			channel.Close()
 			return
 
 		default:
-			s.l.WithField("sshRequest", req.Type).Debug("Rejected unknown request")
+			s.l.Debug("Rejected unknown request", "sshRequest", req.Type)
 			err = req.Reply(false, nil)
 		}
 
 		if err != nil {
-			s.l.WithError(err).Info("Error handling ssh session requests")
-			s.Close()
+			s.l.Info("Error handling ssh session requests", "error", err)
 			return
 		}
 	}
 }
 
-func (s *session) createTerm(channel ssh.Channel) *terminal.Terminal {
-	//TODO: PS1 with nebula cert name
-	term := terminal.NewTerminal(channel, s.c.User()+"@nebula > ")
+func (s *session) createTerm(channel ssh.Channel) *term.Terminal {
+	term := term.NewTerminal(channel, s.c.User()+"@nebula > ")
 	term.AutoCompleteCallback = func(line string, pos int, key rune) (newLine string, newPos int, ok bool) {
 		// key 9 is tab
 		if key == 9 {
-			cmds := matchCommand(s.commands, line)
+			cmds := s.commands.Match(line)
 			if len(cmds) == 1 {
 				return cmds[0] + " ", len(cmds[0]) + 1, true
 			}
@@ -127,17 +151,15 @@ func (s *session) createTerm(channel ssh.Channel) *terminal.Terminal {
 		return "", 0, false
 	}
 
-	go s.handleInput(channel)
+	go s.handleInput()
 	return term
 }
 
-func (s *session) handleInput(channel ssh.Channel) {
-	defer s.Close()
-	w := &stringWriter{w: s.term}
+func (s *session) handleInput() {
+	w := commands.MergedOutput(s.term)
 	for {
 		line, err := s.term.ReadLine()
 		if err != nil {
-			//TODO: log
 			break
 		}
 
@@ -145,46 +167,23 @@ func (s *session) handleInput(channel ssh.Channel) {
 	}
 }
 
-func (s *session) dispatchCommand(line string, w StringWriter) {
-	args, err := shlex.Split(line, true)
-	if err != nil {
-		//todo: LOG IT
-		return
+// dispatchCommand runs line and returns the command's error, which it has logged unless
+// the command already told the user everything: the log line is for the operator reading
+// the daemon's log, who learns nothing from a failure the user caused.
+func (s *session) dispatchCommand(line string, w commands.Output) error {
+	err := s.commands.Dispatch(line, w)
+	if err == nil {
+		return nil
 	}
 
-	if len(args) == 0 {
-		dumpCommands(s.commands, w)
-		return
+	var f *commands.Failure
+	if !errors.As(err, &f) {
+		s.l.Debug("Command returned an error", "line", line, "error", err)
 	}
-
-	c, err := lookupCommand(s.commands, args[0])
-	if err != nil {
-		//TODO: handle the error
-		return
-	}
-
-	if c == nil {
-		err := w.WriteLine(fmt.Sprintf("did not understand: %s", line))
-		//TODO: log error
-		_ = err
-
-		dumpCommands(s.commands, w)
-		return
-	}
-
-	if checkHelpArgs(args) {
-		s.dispatchCommand(fmt.Sprintf("%s %s", "help", c.Name), w)
-		return
-	}
-
-	err = execCommand(c, args[1:], w)
-	if err != nil {
-		//TODO: log the error
-	}
-	return
+	return err
 }
 
 func (s *session) Close() {
 	s.c.Close()
-	s.exitChan <- true
+	s.cancel()
 }

@@ -1,32 +1,51 @@
 package overlay
 
 import (
-	"encoding/binary"
+	"context"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
+	"net/netip"
 	"strings"
 
 	"github.com/rcrowley/go-metrics"
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/overlay/tio"
+	"github.com/slackhq/nebula/routing"
 )
 
 type disabledTun struct {
-	read chan []byte
-	cidr *net.IPNet
+	read        chan []byte
+	vpnNetworks []netip.Prefix
 
 	// Track these metrics since we don't have the tun device to do it for us
 	tx metrics.Counter
 	rx metrics.Counter
-	l  *logrus.Logger
+	l  *slog.Logger
 }
 
-func newDisabledTun(cidr *net.IPNet, queueLen int, metricsEnabled bool, l *logrus.Logger) *disabledTun {
+// Read hands the next queued packet to a reader, copying it into b. Reads
+// from concurrent queues are safe: the channel receive serializes them and
+// each queue copies into its own private scratch buffer.
+func (t *disabledTun) Read(b []byte) (int, error) {
+	r, ok := <-t.read
+	if !ok {
+		return 0, io.EOF
+	}
+
+	t.tx.Inc(1)
+	if t.l.Enabled(context.Background(), slog.LevelDebug) {
+		t.l.Debug("Write payload", "raw", prettyPacket(r))
+	}
+
+	return copy(b, r), nil
+}
+
+func newDisabledTun(vpnNetworks []netip.Prefix, queueLen int, metricsEnabled bool, l *slog.Logger) *disabledTun {
 	tun := &disabledTun{
-		cidr: cidr,
-		read: make(chan []byte, queueLen),
-		l:    l,
+		vpnNetworks: vpnNetworks,
+		read:        make(chan []byte, queueLen),
+		l:           l,
 	}
 
 	if metricsEnabled {
@@ -44,71 +63,30 @@ func (*disabledTun) Activate() error {
 	return nil
 }
 
-func (*disabledTun) RouteFor(iputil.VpnIp) iputil.VpnIp {
-	return 0
+func (*disabledTun) RoutesFor(addr netip.Addr) routing.Gateways {
+	return routing.Gateways{}
 }
 
-func (t *disabledTun) Cidr() *net.IPNet {
-	return t.cidr
+func (t *disabledTun) Networks() []netip.Prefix {
+	return t.vpnNetworks
 }
 
 func (*disabledTun) Name() string {
 	return "disabled"
 }
 
-func (t *disabledTun) Read(b []byte) (int, error) {
-	r, ok := <-t.read
-	if !ok {
-		return 0, io.EOF
-	}
-
-	if len(r) > len(b) {
-		return 0, fmt.Errorf("packet larger than mtu: %d > %d bytes", len(r), len(b))
-	}
-
-	t.tx.Inc(1)
-	if t.l.Level >= logrus.DebugLevel {
-		t.l.WithField("raw", prettyPacket(r)).Debugf("Write payload")
-	}
-
-	return copy(b, r), nil
-}
-
 func (t *disabledTun) handleICMPEchoRequest(b []byte) bool {
-	// Return early if this is not a simple ICMP Echo Request
-	//TODO: make constants out of these
-	if !(len(b) >= 28 && len(b) <= 9001 && b[0] == 0x45 && b[9] == 0x01 && b[20] == 0x08) {
+	out := make([]byte, len(b))
+	out = iputil.CreateICMPEchoResponse(b, out)
+	if out == nil {
 		return false
 	}
-
-	// We don't support fragmented packets
-	if b[7] != 0 || (b[6]&0x2F != 0) {
-		return false
-	}
-
-	buf := make([]byte, len(b))
-	copy(buf, b)
-
-	// Swap dest / src IPs and recalculate checksum
-	ipv4 := buf[0:20]
-	copy(ipv4[12:16], b[16:20])
-	copy(ipv4[16:20], b[12:16])
-	ipv4[10] = 0
-	ipv4[11] = 0
-	binary.BigEndian.PutUint16(ipv4[10:], ipChecksum(ipv4))
-
-	// Change type to ICMP Echo Reply and recalculate checksum
-	icmp := buf[20:]
-	icmp[0] = 0
-	icmp[2] = 0
-	icmp[3] = 0
-	binary.BigEndian.PutUint16(icmp[2:], ipChecksum(icmp))
 
 	// attempt to write it, but don't block
 	select {
-	case t.read <- buf:
+	case t.read <- out:
 	default:
-		t.l.Debugf("tun_disabled: dropped ICMP Echo Reply response")
+		t.l.Debug("tun_disabled: dropped ICMP Echo Reply response")
 	}
 
 	return true
@@ -119,17 +97,23 @@ func (t *disabledTun) Write(b []byte) (int, error) {
 
 	// Check for ICMP Echo Request before spending time doing the full parsing
 	if t.handleICMPEchoRequest(b) {
-		if t.l.Level >= logrus.DebugLevel {
-			t.l.WithField("raw", prettyPacket(b)).Debugf("Disabled tun responded to ICMP Echo Request")
+		if t.l.Enabled(context.Background(), slog.LevelDebug) {
+			t.l.Debug("Disabled tun responded to ICMP Echo Request", "raw", prettyPacket(b))
 		}
-	} else if t.l.Level >= logrus.DebugLevel {
-		t.l.WithField("raw", prettyPacket(b)).Debugf("Disabled tun received unexpected payload")
+	} else if t.l.Enabled(context.Background(), slog.LevelDebug) {
+		t.l.Debug("Disabled tun received unexpected payload", "raw", prettyPacket(b))
 	}
 	return len(b), nil
 }
 
-func (t *disabledTun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
-	return t, nil
+func (t *disabledTun) Queues(n int) ([]tio.Queue, error) {
+	out := make([]tio.Queue, n)
+	for i := range out {
+		// NoClose: the shared channel and metrics are owned by the
+		// disabledTun; Close on the device tears them down once for everybody.
+		out[i] = tio.NewSingleQueueNoClose(t, defaultBatchBufSize)
+	}
+	return out, nil
 }
 
 func (t *disabledTun) Close() error {
@@ -153,23 +137,4 @@ func (p prettyPacket) String() string {
 	}
 
 	return s.String()
-}
-
-func ipChecksum(b []byte) uint16 {
-	var c uint32
-	sz := len(b) - 1
-
-	for i := 0; i < sz; i += 2 {
-		c += uint32(b[i]) << 8
-		c += uint32(b[i+1])
-	}
-	if sz%2 == 0 {
-		c += uint32(b[sz]) << 8
-	}
-
-	for (c >> 16) > 0 {
-		c = (c & 0xffff) + (c >> 16)
-	}
-
-	return ^uint16(c)
 }

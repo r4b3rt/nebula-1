@@ -1,56 +1,77 @@
 //go:build e2e_testing
-// +build e2e_testing
 
 package overlay
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
+	"net/netip"
+	"os"
+	"sync/atomic"
 
-	"github.com/sirupsen/logrus"
-	"github.com/slackhq/nebula/cidr"
-	"github.com/slackhq/nebula/iputil"
+	"github.com/gaissmai/bart"
+	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/overlay/tio"
+	"github.com/slackhq/nebula/routing"
+	"github.com/slackhq/nebula/udp"
 )
 
 type TestTun struct {
-	Device    string
-	cidr      *net.IPNet
-	Routes    []Route
-	routeTree *cidr.Tree4
-	l         *logrus.Logger
+	Device      string
+	vpnNetworks []netip.Prefix
+	Routes      []Route
+	routeTree   *bart.Table[routing.Gateways]
+	l           *slog.Logger
 
+	closed    atomic.Bool
 	rxPackets chan []byte // Packets to receive into nebula
 	TxPackets chan []byte // Packets transmitted outside by nebula
 }
 
-func newTun(l *logrus.Logger, deviceName string, cidr *net.IPNet, _ int, routes []Route, _ int, _ bool) (*TestTun, error) {
+func newTun(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, _ bool) (*TestTun, error) {
+	_, routes, err := getAllRoutesFromConfig(l, c, vpnNetworks, true)
+	if err != nil {
+		return nil, err
+	}
 	routeTree, err := makeRouteTree(l, routes, false)
 	if err != nil {
 		return nil, err
 	}
 
 	return &TestTun{
-		Device:    deviceName,
-		cidr:      cidr,
-		Routes:    routes,
-		routeTree: routeTree,
-		l:         l,
-		rxPackets: make(chan []byte, 1),
-		TxPackets: make(chan []byte, 1),
+		Device:      c.GetString("tun.dev", ""),
+		vpnNetworks: vpnNetworks,
+		Routes:      routes,
+		routeTree:   routeTree,
+		l:           l,
+		rxPackets:   make(chan []byte, 10),
+		TxPackets:   make(chan []byte, 10),
 	}, nil
 }
 
-func newTunFromFd(_ *logrus.Logger, _ int, _ *net.IPNet, _ int, _ []Route, _ int) (*TestTun, error) {
+func newTunFromFd(_ *config.C, _ *slog.Logger, _ int, _ []netip.Prefix) (*TestTun, error) {
 	return nil, fmt.Errorf("newTunFromFd not supported")
 }
 
-// Send will place a byte array onto the receive queue for nebula to consume
+// Send will place a byte array onto the receive queue for nebula to consume.
 // These are unencrypted ip layer frames destined for another nebula node.
-// packets should exit the udp side, capture them with udpConn.Get
+// packets should exit the udp side, capture them with udpConn.Get.
+//
+// Send copies the input via the freelist, so the caller is free to mutate
+// or reuse it after the call returns.
 func (t *TestTun) Send(packet []byte) {
-	t.l.WithField("dataLen", len(packet)).Info("Tun receiving injected packet")
-	t.rxPackets <- packet
+	if t.closed.Load() {
+		return
+	}
+
+	if t.l.Enabled(context.Background(), slog.LevelDebug) {
+		t.l.Debug("Tun receiving injected packet", "dataLen", len(packet))
+	}
+	buf := acquireTunBuf(len(packet))
+	copy(buf, packet)
+	t.rxPackets <- buf
 }
 
 // Get will pull an unencrypted ip layer frame from the transmit queue
@@ -73,21 +94,17 @@ func (t *TestTun) Get(block bool) []byte {
 // Below this is boilerplate implementation to make nebula actually work
 //********************************************************************************************************************//
 
-func (t *TestTun) RouteFor(ip iputil.VpnIp) iputil.VpnIp {
-	r := t.routeTree.MostSpecificContains(ip)
-	if r != nil {
-		return r.(iputil.VpnIp)
-	}
-
-	return 0
+func (t *TestTun) RoutesFor(ip netip.Addr) routing.Gateways {
+	r, _ := t.routeTree.Lookup(ip)
+	return r
 }
 
 func (t *TestTun) Activate() error {
 	return nil
 }
 
-func (t *TestTun) Cidr() *net.IPNet {
-	return t.cidr
+func (t *TestTun) Networks() []netip.Prefix {
+	return t.vpnNetworks
 }
 
 func (t *TestTun) Name() string {
@@ -95,23 +112,71 @@ func (t *TestTun) Name() string {
 }
 
 func (t *TestTun) Write(b []byte) (n int, err error) {
-	packet := make([]byte, len(b), len(b))
+	if t.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
+
+	packet := acquireTunBuf(len(b))
 	copy(packet, b)
 	t.TxPackets <- packet
 	return len(b), nil
 }
 
+// ReleaseTunBuf returns a slice from TxPackets to the harness freelist, don't use the bytes after the call.
+// Channel-backed instead of sync.Pool because putting a []byte in a sync.Pool escapes the slice header to heap.
+func ReleaseTunBuf(b []byte) {
+	if b == nil {
+		return
+	}
+	select {
+	case tunBufFreelist <- b:
+	default:
+		// Freelist full; drop the buffer for the GC.
+	}
+}
+
+// tunBufFreelist retains the backing arrays for TestTun.Write so steady-state allocation drops to zero once the
+// freelist has saturated for the current MTU.
+var tunBufFreelist = make(chan []byte, 64)
+
+func acquireTunBuf(n int) []byte {
+	var b []byte
+	select {
+	case b = <-tunBufFreelist:
+	default:
+		b = make([]byte, 0, udp.MTU)
+	}
+	if cap(b) < n {
+		b = make([]byte, n)
+	} else {
+		b = b[:n]
+	}
+	return b
+}
+
 func (t *TestTun) Close() error {
-	close(t.rxPackets)
+	if t.closed.CompareAndSwap(false, true) {
+		close(t.rxPackets)
+		close(t.TxPackets)
+	}
 	return nil
 }
 
 func (t *TestTun) Read(b []byte) (int, error) {
-	p := <-t.rxPackets
+	p, ok := <-t.rxPackets
+	if !ok {
+		return 0, os.ErrClosed
+	}
+	n := len(p)
 	copy(b, p)
-	return len(p), nil
+	// Send always pushes a freelist-acquired slice, return it once we've copied the bytes into the caller's buffer.
+	select {
+	case tunBufFreelist <- p:
+	default:
+	}
+	return n, nil
 }
 
-func (t *TestTun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
-	return nil, fmt.Errorf("TODO: multiqueue not implemented")
+func (t *TestTun) Queues(int) ([]tio.Queue, error) {
+	return []tio.Queue{tio.NewSingleQueue(t, udp.MTU)}, nil
 }

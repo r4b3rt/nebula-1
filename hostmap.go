@@ -2,66 +2,267 @@ package nebula
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"log/slog"
+	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/gaissmai/bart"
 	"github.com/rcrowley/go-metrics"
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/cert"
-	"github.com/slackhq/nebula/cidr"
+	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/iputil"
-	"github.com/slackhq/nebula/udp"
 )
 
-//const ProbeLen = 100
-const PromoteEvery = 1000
-const ReQueryEvery = 5000
+const defaultPromoteEvery = 1000       // Count of packets sent before we try moving a tunnel to a preferred underlay ip address
+const defaultReQueryEvery = 5000       // Count of packets sent before re-querying a hostinfo to the lighthouse
+const defaultReQueryWait = time.Minute // Minimum amount of seconds to wait before re-querying a hostinfo the lighthouse. Evaluated every ReQueryEvery
 const MaxRemotes = 10
+
+// MaxHostInfosPerVpnIp is the max number of hostinfos we will track for a given vpn ip
+// 5 allows for an initial handshake and each host pair re-handshaking twice
+const MaxHostInfosPerVpnIp = 5
 
 // How long we should prevent roaming back to the previous IP.
 // This helps prevent flapping due to packets already in flight
 const RoamingSuppressSeconds = 2
 
-type HostMap struct {
-	sync.RWMutex    //Because we concurrently read and write to our maps
-	name            string
-	Indexes         map[uint32]*HostInfo
-	RemoteIndexes   map[uint32]*HostInfo
-	Hosts           map[iputil.VpnIp]*HostInfo
-	preferredRanges []*net.IPNet
-	vpnCIDR         *net.IPNet
-	metricsEnabled  bool
-	l               *logrus.Logger
+const (
+	Requested = iota
+	PeerRequested
+	Established
+	Disestablished
+)
+
+const (
+	Unknowntype = iota
+	ForwardingType
+	TerminalType
+)
+
+type Relay struct {
+	Type        int
+	State       int
+	LocalIndex  uint32
+	RemoteIndex uint32
+	PeerAddr    netip.Addr
 }
 
-type HostInfo struct {
+type HostMap struct {
+	sync.RWMutex  //Because we concurrently read and write to our maps
+	Indexes       map[uint32]*HostInfo
+	Relays        map[uint32]*HostInfo // Maps a Relay IDX to a Relay HostInfo object
+	RemoteIndexes map[uint32]*HostInfo
+	// Hosts maps a vpn address to its primary hostinfo, one entry per address we hold a tunnel
+	// for. moreHosts only has an entry while an address is held by 2 or more hostinfos and stores
+	// the full most-recent-first list; moreHosts[a][0] is always the same hostinfo as Hosts[a].
+	// Each address gets its own independent list, so a hostinfo owning multiple addresses can
+	// never corrupt another address's ordering the way the old shared next/prev chain could.
+	// Entries in moreHosts are only ever written by unlockedSetHostsForAddr; Hosts is written
+	// directly only in the single-hostinfo fast paths where moreHosts is known to have no entry,
+	// and unlockedDeleteHostInfo swaps either map for a fresh one when it fully drains.
+	Hosts           map[netip.Addr]*HostInfo
+	moreHosts       map[netip.Addr][]*HostInfo
+	preferredRanges atomic.Pointer[[]netip.Prefix]
+	l               *slog.Logger
+}
+
+// For synchronization, treat the pointed-to Relay struct as immutable. To edit the Relay
+// struct, make a copy of an existing value, edit the fileds in the copy, and
+// then store a pointer to the new copy in both realyForBy* maps.
+type RelayState struct {
 	sync.RWMutex
 
-	remote            *udp.Addr
-	remotes           *RemoteList
-	promoteCounter    uint32
-	ConnectionState   *ConnectionState
-	handshakeStart    time.Time        //todo: this an entry in the handshake manager
-	HandshakeReady    bool             //todo: being in the manager means you are ready
-	HandshakeCounter  int              //todo: another handshake manager entry
-	HandshakeComplete bool             //todo: this should go away in favor of ConnectionState.ready
-	HandshakePacket   map[uint8][]byte //todo: this is other handshake manager entry
-	packetStore       []*cachedPacket  //todo: this is other handshake manager entry
-	remoteIndexId     uint32
-	localIndexId      uint32
-	vpnIp             iputil.VpnIp
-	recvError         int
-	remoteCidr        *cidr.Tree4
+	relays []netip.Addr // Ordered set of VpnAddrs of Hosts to use as relays to access this peer
+	// For data race avoidance, the contents of a *Relay are treated immutably. To update a *Relay, copy the existing data,
+	// modify what needs to be updated, and store the new modified copy in the relayForByIp and relayForByIdx maps (with
+	// the RelayState Lock held)
+	relayForByAddr map[netip.Addr]*Relay // Maps vpnAddr of peers for which this HostInfo is a relay to some Relay info
+	relayForByIdx  map[uint32]*Relay     // Maps a local index to some Relay info
+}
 
-	// lastRebindCount is the other side of Interface.rebindCount, if these values don't match then we need to ask LH
-	// for a punch from the remote end of this tunnel. The goal being to prime their conntrack for our traffic just like
-	// with a handshake
-	lastRebindCount int8
+func (rs *RelayState) DeleteRelay(ip netip.Addr) {
+	rs.Lock()
+	defer rs.Unlock()
+	for idx, val := range rs.relays {
+		if val == ip {
+			rs.relays = append(rs.relays[:idx], rs.relays[idx+1:]...)
+			return
+		}
+	}
+}
+
+func (rs *RelayState) UpdateRelayForByIpState(vpnIp netip.Addr, state int) {
+	rs.Lock()
+	defer rs.Unlock()
+	if r, ok := rs.relayForByAddr[vpnIp]; ok {
+		newRelay := *r
+		newRelay.State = state
+		rs.relayForByAddr[newRelay.PeerAddr] = &newRelay
+		rs.relayForByIdx[newRelay.LocalIndex] = &newRelay
+	}
+}
+
+func (rs *RelayState) UpdateRelayForByIdxState(idx uint32, state int) {
+	rs.Lock()
+	defer rs.Unlock()
+	if r, ok := rs.relayForByIdx[idx]; ok {
+		newRelay := *r
+		newRelay.State = state
+		rs.relayForByAddr[newRelay.PeerAddr] = &newRelay
+		rs.relayForByIdx[newRelay.LocalIndex] = &newRelay
+	}
+}
+
+func (rs *RelayState) CopyAllRelayFor() []*Relay {
+	rs.RLock()
+	defer rs.RUnlock()
+	ret := make([]*Relay, 0, len(rs.relayForByIdx))
+	for _, r := range rs.relayForByIdx {
+		ret = append(ret, r)
+	}
+	return ret
+}
+
+func (rs *RelayState) GetRelayForByAddr(addr netip.Addr) (*Relay, bool) {
+	rs.RLock()
+	defer rs.RUnlock()
+	r, ok := rs.relayForByAddr[addr]
+	return r, ok
+}
+
+func (rs *RelayState) InsertRelayTo(ip netip.Addr) {
+	rs.Lock()
+	defer rs.Unlock()
+	if !slices.Contains(rs.relays, ip) {
+		rs.relays = append(rs.relays, ip)
+	}
+}
+
+func (rs *RelayState) CopyRelayIps() []netip.Addr {
+	rs.RLock()
+	defer rs.RUnlock()
+	ret := make([]netip.Addr, len(rs.relays))
+	copy(ret, rs.relays)
+	return ret
+}
+
+func (rs *RelayState) CopyRelayForIps() []netip.Addr {
+	rs.RLock()
+	defer rs.RUnlock()
+	currentRelays := make([]netip.Addr, 0, len(rs.relayForByAddr))
+	for relayIp := range rs.relayForByAddr {
+		currentRelays = append(currentRelays, relayIp)
+	}
+	return currentRelays
+}
+
+func (rs *RelayState) CopyRelayForIdxs() []uint32 {
+	rs.RLock()
+	defer rs.RUnlock()
+	ret := make([]uint32, 0, len(rs.relayForByIdx))
+	for i := range rs.relayForByIdx {
+		ret = append(ret, i)
+	}
+	return ret
+}
+
+func (rs *RelayState) CompleteRelayByIP(vpnIp netip.Addr, remoteIdx uint32) bool {
+	rs.Lock()
+	defer rs.Unlock()
+	r, ok := rs.relayForByAddr[vpnIp]
+	if !ok {
+		return false
+	}
+	newRelay := *r
+	newRelay.State = Established
+	newRelay.RemoteIndex = remoteIdx
+	rs.relayForByIdx[r.LocalIndex] = &newRelay
+	rs.relayForByAddr[r.PeerAddr] = &newRelay
+	return true
+}
+
+func (rs *RelayState) CompleteRelayByIdx(localIdx uint32, remoteIdx uint32) (*Relay, bool) {
+	rs.Lock()
+	defer rs.Unlock()
+	r, ok := rs.relayForByIdx[localIdx]
+	if !ok {
+		return nil, false
+	}
+	newRelay := *r
+	newRelay.State = Established
+	newRelay.RemoteIndex = remoteIdx
+	rs.relayForByIdx[r.LocalIndex] = &newRelay
+	rs.relayForByAddr[r.PeerAddr] = &newRelay
+	return &newRelay, true
+}
+
+func (rs *RelayState) QueryRelayForByIp(vpnIp netip.Addr) (*Relay, bool) {
+	rs.RLock()
+	defer rs.RUnlock()
+	r, ok := rs.relayForByAddr[vpnIp]
+	return r, ok
+}
+
+func (rs *RelayState) QueryRelayForByIdx(idx uint32) (*Relay, bool) {
+	rs.RLock()
+	defer rs.RUnlock()
+	r, ok := rs.relayForByIdx[idx]
+	return r, ok
+}
+
+func (rs *RelayState) InsertRelay(ip netip.Addr, idx uint32, r *Relay) {
+	rs.Lock()
+	defer rs.Unlock()
+	rs.relayForByAddr[ip] = r
+	rs.relayForByIdx[idx] = r
+}
+
+type NetworkType uint8
+
+const (
+	NetworkTypeUnknown NetworkType = iota
+	// NetworkTypeVPN is a network that overlaps one or more of the vpnNetworks in our certificate
+	NetworkTypeVPN
+	// NetworkTypeVPNPeer is a network that does not overlap one of our networks
+	NetworkTypeVPNPeer
+	// NetworkTypeUnsafe is a network from Certificate.UnsafeNetworks()
+	NetworkTypeUnsafe
+)
+
+type HostInfo struct {
+	remote          atomic.Pointer[netip.AddrPort]
+	ConnectionState *ConnectionState
+
+	// Traffic bits, pendingDeletion, and the rebind epoch we last sent under
+	state atomic.Uint32
+
+	promoteCounter atomic.Uint32
+	remoteIndexId  uint32
+	localIndexId   uint32
+	remotes        *RemoteList
+
+	// vpnAddrs is a list of vpn addresses assigned to this host that are within our own vpn networks
+	// The host may have other vpn addresses that are outside our
+	// vpn networks but were removed because they are not usable
+	vpnAddrs []netip.Addr
+
+	// networks is a combination of specific vpn addresses (not prefixes!) and full unsafe networks assigned to this host.
+	networks   *bart.Table[NetworkType]
+	relayState RelayState
+
+	// HandshakePacket records the packets used to create this hostinfo
+	// We need these to avoid replayed handshake packets creating new hostinfos which causes churn
+	HandshakePacket map[uint8][]byte
+
+	// nextLHQuery is the earliest we can ask the lighthouse for new information.
+	// This is used to limit lighthouse re-queries in chatty clients
+	nextLHQuery atomic.Int64
 
 	// lastHandshakeTime records the time the remote side told us about at the stage when the handshake was completed locally
 	// Stage 1 packet will contain it if I am a responder, stage 2 packet if I am an initiator
@@ -69,7 +270,33 @@ type HostInfo struct {
 	lastHandshakeTime uint64
 
 	lastRoam       time.Time
-	lastRoamRemote *udp.Addr
+	lastRoamRemote netip.AddrPort
+
+	// lastUsed tracks the last time ConnectionManager checked the tunnel and it was in use.
+	// This value will be behind against actual tunnel utilization in the hot path.
+	// This should only be used by the ConnectionManagers ticker routine.
+	lastUsed time.Time
+}
+
+type ViaSender struct {
+	UdpAddr   netip.AddrPort
+	relayHI   *HostInfo // relayHI is the host info object of the relay
+	relay     *Relay    // relay contains the rest of the relay information, including the PeerIP of the host trying to communicate with us.
+	IsRelayed bool      // IsRelayed is true if the packet was sent through a relay
+}
+
+func (v ViaSender) String() string {
+	if v.IsRelayed {
+		return fmt.Sprintf("%s (relayed)", v.UdpAddr)
+	}
+	return v.UdpAddr.String()
+}
+
+func (v ViaSender) MarshalJSON() ([]byte, error) {
+	if v.IsRelayed {
+		return json.Marshal(m{"relay": v.UdpAddr})
+	}
+	return json.Marshal(m{"direct": v.UdpAddr})
 }
 
 type cachedPacket struct {
@@ -86,440 +313,563 @@ type cachedPacketMetrics struct {
 	dropped metrics.Counter
 }
 
-func NewHostMap(l *logrus.Logger, name string, vpnCIDR *net.IPNet, preferredRanges []*net.IPNet) *HostMap {
-	h := map[iputil.VpnIp]*HostInfo{}
-	i := map[uint32]*HostInfo{}
-	r := map[uint32]*HostInfo{}
-	m := HostMap{
-		name:            name,
-		Indexes:         i,
-		RemoteIndexes:   r,
-		Hosts:           h,
-		preferredRanges: preferredRanges,
-		vpnCIDR:         vpnCIDR,
-		l:               l,
-	}
-	return &m
+func NewHostMapFromConfig(l *slog.Logger, c *config.C) *HostMap {
+	hm := newHostMap(l)
+
+	hm.reload(c, true, nil)
+	c.RegisterReloadCallback(func(c *config.C, r *config.Reload) {
+		hm.reload(c, false, r)
+	})
+
+	l.Info("Main HostMap created", "preferredRanges", hm.GetPreferredRanges())
+
+	return hm
 }
 
-// UpdateStats takes a name and reports host and index counts to the stats collection system
-func (hm *HostMap) EmitStats(name string) {
+func newHostMap(l *slog.Logger) *HostMap {
+	return &HostMap{
+		Indexes:       map[uint32]*HostInfo{},
+		Relays:        map[uint32]*HostInfo{},
+		RemoteIndexes: map[uint32]*HostInfo{},
+		Hosts:         map[netip.Addr]*HostInfo{},
+		moreHosts:     map[netip.Addr][]*HostInfo{},
+		l:             l,
+	}
+}
+
+// r is nil on the initial load
+func (hm *HostMap) reload(c *config.C, initial bool, r *config.Reload) {
+	if initial || c.HasChanged("preferred_ranges") {
+		var preferredRanges []netip.Prefix
+		rawPreferredRanges := c.GetStringSlice("preferred_ranges", []string{})
+
+		for _, rawPreferredRange := range rawPreferredRanges {
+			preferredRange, err := netip.ParsePrefix(rawPreferredRange)
+
+			if err != nil {
+				hm.l.Warn("Failed to parse preferred ranges, ignoring",
+					"error", err,
+					"range", rawPreferredRange,
+				)
+				r.Failed()
+				continue
+			}
+
+			preferredRanges = append(preferredRanges, preferredRange)
+		}
+
+		oldRanges := hm.preferredRanges.Swap(&preferredRanges)
+		if !initial {
+			hm.l.Info("preferred_ranges changed",
+				"oldPreferredRanges", *oldRanges,
+				"newPreferredRanges", preferredRanges,
+			)
+		}
+	}
+}
+
+// EmitStats reports host, index, and relay counts to the stats collection system
+func (hm *HostMap) EmitStats() {
 	hm.RLock()
 	hostLen := len(hm.Hosts)
 	indexLen := len(hm.Indexes)
 	remoteIndexLen := len(hm.RemoteIndexes)
+	relaysLen := len(hm.Relays)
 	hm.RUnlock()
 
-	metrics.GetOrRegisterGauge("hostmap."+name+".hosts", nil).Update(int64(hostLen))
-	metrics.GetOrRegisterGauge("hostmap."+name+".indexes", nil).Update(int64(indexLen))
-	metrics.GetOrRegisterGauge("hostmap."+name+".remoteIndexes", nil).Update(int64(remoteIndexLen))
+	metrics.GetOrRegisterGauge("hostmap.main.hosts", nil).Update(int64(hostLen))
+	metrics.GetOrRegisterGauge("hostmap.main.indexes", nil).Update(int64(indexLen))
+	metrics.GetOrRegisterGauge("hostmap.main.remoteIndexes", nil).Update(int64(remoteIndexLen))
+	metrics.GetOrRegisterGauge("hostmap.main.relayIndexes", nil).Update(int64(relaysLen))
 }
 
-func (hm *HostMap) GetIndexByVpnIp(vpnIp iputil.VpnIp) (uint32, error) {
-	hm.RLock()
-	if i, ok := hm.Hosts[vpnIp]; ok {
-		index := i.localIndexId
-		hm.RUnlock()
-		return index, nil
+// unlockedSetHostsForAddr stores the per-address hostinfo list (list[0] is the primary). An empty
+// list removes the address. This is the one place Hosts and moreHosts are written together, keep
+// it that way. Callers must hold the write lock.
+func (hm *HostMap) unlockedSetHostsForAddr(addr netip.Addr, list []*HostInfo) {
+	if len(list) == 0 {
+		delete(hm.Hosts, addr)
+		delete(hm.moreHosts, addr)
+		return
 	}
-	hm.RUnlock()
-	return 0, errors.New("vpn IP not found")
-}
-
-func (hm *HostMap) Add(ip iputil.VpnIp, hostinfo *HostInfo) {
-	hm.Lock()
-	hm.Hosts[ip] = hostinfo
-	hm.Unlock()
-}
-
-func (hm *HostMap) AddVpnIp(vpnIp iputil.VpnIp, init func(hostinfo *HostInfo)) (hostinfo *HostInfo, created bool) {
-	hm.RLock()
-	if h, ok := hm.Hosts[vpnIp]; !ok {
-		hm.RUnlock()
-		h = &HostInfo{
-			promoteCounter:  0,
-			vpnIp:           vpnIp,
-			HandshakePacket: make(map[uint8][]byte, 0),
-		}
-		if init != nil {
-			init(h)
-		}
-		hm.Lock()
-		hm.Hosts[vpnIp] = h
-		hm.Unlock()
-		return h, true
+	hm.Hosts[addr] = list[0]
+	if len(list) > 1 {
+		hm.moreHosts[addr] = list
 	} else {
-		hm.RUnlock()
-		return h, false
+		delete(hm.moreHosts, addr)
 	}
 }
 
-func (hm *HostMap) DeleteVpnIp(vpnIp iputil.VpnIp) {
-	hm.Lock()
-	delete(hm.Hosts, vpnIp)
-	if len(hm.Hosts) == 0 {
-		hm.Hosts = map[iputil.VpnIp]*HostInfo{}
+// unlockedGetHostList returns every hostinfo holding addr, primary first, or nil if we have no
+// tunnel for addr. The common single-hostinfo case builds a fresh one element list, so keep this
+// off the packet hot path; the primary is a direct Hosts read. Callers must hold the lock (read
+// or write).
+func (hm *HostMap) unlockedGetHostList(addr netip.Addr) []*HostInfo {
+	if list, ok := hm.moreHosts[addr]; ok {
+		return list
 	}
+	if h, ok := hm.Hosts[addr]; ok {
+		return []*HostInfo{h}
+	}
+	return nil
+}
+
+// removeHostInfo returns list with hi removed (order preserved), or list unchanged if hi is
+// absent. It deletes in place: every mutator holds the hostmap write lock and no reader ever
+// retains a slice across a mutation (readers iterate under RLock), so there is no snapshot to
+// invalidate.
+func removeHostInfo(list []*HostInfo, hi *HostInfo) []*HostInfo {
+	idx := slices.Index(list, hi)
+	if idx < 0 {
+		return list
+	}
+	return slices.Delete(list, idx, idx+1)
+}
+
+// DeleteHostInfo will fully unlink the hostinfo and return true if no other hostinfo still holds
+// any of its vpn addrs, meaning we no longer have a tunnel to the peer
+func (hm *HostMap) DeleteHostInfo(hostinfo *HostInfo) bool {
+	// Delete the host itself, ensuring it's not modified anymore
+	hm.Lock()
+	final := hm.unlockedDeleteHostInfo(hostinfo)
 	hm.Unlock()
 
-	if hm.l.Level >= logrus.DebugLevel {
-		hm.l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": vpnIp, "mapTotalSize": len(hm.Hosts)}).
-			Debug("Hostmap vpnIp deleted")
-	}
+	return final
 }
 
-// Only used by pendingHostMap when the remote index is not initially known
-func (hm *HostMap) addRemoteIndexHostInfo(index uint32, h *HostInfo) {
-	hm.Lock()
-	h.remoteIndexId = index
-	hm.RemoteIndexes[index] = h
-	hm.Unlock()
-
-	if hm.l.Level > logrus.DebugLevel {
-		hm.l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes),
-			"hostinfo": m{"existing": true, "localIndexId": h.localIndexId, "hostId": h.vpnIp}}).
-			Debug("Hostmap remoteIndex added")
-	}
-}
-
-func (hm *HostMap) AddVpnIpHostInfo(vpnIp iputil.VpnIp, h *HostInfo) {
-	hm.Lock()
-	h.vpnIp = vpnIp
-	hm.Hosts[vpnIp] = h
-	hm.Indexes[h.localIndexId] = h
-	hm.RemoteIndexes[h.remoteIndexId] = h
-	hm.Unlock()
-
-	if hm.l.Level > logrus.DebugLevel {
-		hm.l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": vpnIp, "mapTotalSize": len(hm.Hosts),
-			"hostinfo": m{"existing": true, "localIndexId": h.localIndexId, "vpnIp": h.vpnIp}}).
-			Debug("Hostmap vpnIp added")
-	}
-}
-
-// This is only called in pendingHostmap, to cleanup an inbound handshake
-func (hm *HostMap) DeleteIndex(index uint32) {
-	hm.Lock()
-	hostinfo, ok := hm.Indexes[index]
-	if ok {
-		delete(hm.Indexes, index)
-		delete(hm.RemoteIndexes, hostinfo.remoteIndexId)
-
-		// Check if we have an entry under hostId that matches the same hostinfo
-		// instance. Clean it up as well if we do.
-		hostinfo2, ok := hm.Hosts[hostinfo.vpnIp]
-		if ok && hostinfo2 == hostinfo {
-			delete(hm.Hosts, hostinfo.vpnIp)
-		}
-	}
-	hm.Unlock()
-
-	if hm.l.Level >= logrus.DebugLevel {
-		hm.l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes)}).
-			Debug("Hostmap index deleted")
-	}
-}
-
-// This is used to cleanup on recv_error
-func (hm *HostMap) DeleteReverseIndex(index uint32) {
-	hm.Lock()
-	hostinfo, ok := hm.RemoteIndexes[index]
-	if ok {
-		delete(hm.Indexes, hostinfo.localIndexId)
-		delete(hm.RemoteIndexes, index)
-
-		// Check if we have an entry under hostId that matches the same hostinfo
-		// instance. Clean it up as well if we do (they might not match in pendingHostmap)
-		var hostinfo2 *HostInfo
-		hostinfo2, ok = hm.Hosts[hostinfo.vpnIp]
-		if ok && hostinfo2 == hostinfo {
-			delete(hm.Hosts, hostinfo.vpnIp)
-		}
-	}
-	hm.Unlock()
-
-	if hm.l.Level >= logrus.DebugLevel {
-		hm.l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes)}).
-			Debug("Hostmap remote index deleted")
-	}
-}
-
-func (hm *HostMap) DeleteHostInfo(hostinfo *HostInfo) {
+func (hm *HostMap) MakePrimary(hostinfo *HostInfo) {
 	hm.Lock()
 	defer hm.Unlock()
-	hm.unlockedDeleteHostInfo(hostinfo)
+	hm.unlockedMakePrimary(hostinfo)
 }
 
-func (hm *HostMap) unlockedDeleteHostInfo(hostinfo *HostInfo) {
-	// Check if this same hostId is in the hostmap with a different instance.
-	// This could happen if we have an entry in the pending hostmap with different
-	// index values than the one in the main hostmap.
-	hostinfo2, ok := hm.Hosts[hostinfo.vpnIp]
-	if ok && hostinfo2 != hostinfo {
-		delete(hm.Hosts, hostinfo2.vpnIp)
-		delete(hm.Indexes, hostinfo2.localIndexId)
-		delete(hm.RemoteIndexes, hostinfo2.remoteIndexId)
+// unlockedMakePrimary reports whether hostinfo is (now) the primary for each of its addresses,
+// false only when it is no longer in the hostmap at all.
+func (hm *HostMap) unlockedMakePrimary(hostinfo *HostInfo) bool {
+	// A hostinfo that is no longer in the hostmap must not be re-inserted here. Callers can race
+	// tunnel teardown, deciding to promote under the read lock and only taking the write lock
+	// after a delete fully unlinked the hostinfo (connection manager swapPrimary, AddRelay). Every
+	// live hostinfo is registered in Indexes by unlockedAddHostInfo, so this is a membership test.
+	if hm.Indexes[hostinfo.localIndexId] != hostinfo {
+		return false
 	}
 
-	delete(hm.Hosts, hostinfo.vpnIp)
-	if len(hm.Hosts) == 0 {
-		hm.Hosts = map[iputil.VpnIp]*HostInfo{}
+	// Move hostinfo to the front (primary) of each of its address lists. The lists are
+	// independent per address, so this can never leave a dangling entry the way promoting
+	// against a single shared chain could.
+	for _, addr := range hostinfo.vpnAddrs {
+		if hm.Hosts[addr] == hostinfo {
+			// Already primary for this address, the list is already in the right order
+			continue
+		}
+		list := removeHostInfo(hm.unlockedGetHostList(addr), hostinfo)
+		list = append([]*HostInfo{hostinfo}, list...)
+		hm.unlockedSetHostsForAddr(addr, list)
 	}
+	return true
+}
+
+// unlockedDeleteHostInfo removes hostinfo from every one of its address lists and from the index
+// maps. It returns true if this was the last hostinfo for all of its addresses (we no longer have
+// any tunnel to the peer), which the caller uses to decide whether to clear learned lighthouse
+// state and disestablish relays.
+func (hm *HostMap) unlockedDeleteHostInfo(hostinfo *HostInfo) bool {
+	// Remove this hostinfo from each of its address lists. The lists are independent, so a
+	// sibling is never promoted to an address it does not own and no other list is touched.
+	final := true
+	for _, addr := range hostinfo.vpnAddrs {
+		if list, ok := hm.moreHosts[addr]; ok {
+			list = removeHostInfo(list, hostinfo)
+			hm.unlockedSetHostsForAddr(addr, list)
+			if len(list) > 0 {
+				final = false
+			}
+		} else if existing, ok := hm.Hosts[addr]; ok {
+			if existing == hostinfo {
+				// Common case, the only hostinfo for this address. moreHosts has no entry to clean up.
+				delete(hm.Hosts, addr)
+			} else {
+				// We don't hold this address but another hostinfo does, we still have a tunnel to the peer
+				final = false
+			}
+		}
+	}
+
+	// Go maps never shrink their buckets, replace fully drained maps so a node that churned
+	// through a large peer count gives the memory back. Same idiom as the index maps below.
+	if len(hm.Hosts) == 0 {
+		hm.Hosts = map[netip.Addr]*HostInfo{}
+	}
+	if len(hm.moreHosts) == 0 {
+		hm.moreHosts = map[netip.Addr][]*HostInfo{}
+	}
+
+	// The remote index uses index ids outside our control so lets make sure we are only removing
+	// the remote index pointer here if it points to the hostinfo we are deleting
+	hostinfo2, ok := hm.RemoteIndexes[hostinfo.remoteIndexId]
+	if ok && hostinfo2 == hostinfo {
+		delete(hm.RemoteIndexes, hostinfo.remoteIndexId)
+		if len(hm.RemoteIndexes) == 0 {
+			hm.RemoteIndexes = map[uint32]*HostInfo{}
+		}
+	}
+
 	delete(hm.Indexes, hostinfo.localIndexId)
 	if len(hm.Indexes) == 0 {
 		hm.Indexes = map[uint32]*HostInfo{}
 	}
-	delete(hm.RemoteIndexes, hostinfo.remoteIndexId)
-	if len(hm.RemoteIndexes) == 0 {
-		hm.RemoteIndexes = map[uint32]*HostInfo{}
+
+	if hm.l.Enabled(context.Background(), slog.LevelDebug) {
+		hm.l.Debug("Hostmap hostInfo deleted",
+			"hostMap", m{"mapTotalSize": len(hm.Hosts),
+				"vpnAddrs": hostinfo.vpnAddrs, "indexNumber": hostinfo.localIndexId, "remoteIndexNumber": hostinfo.remoteIndexId},
+		)
 	}
 
-	if hm.l.Level >= logrus.DebugLevel {
-		hm.l.WithField("hostMap", m{"mapName": hm.name, "mapTotalSize": len(hm.Hosts),
-			"vpnIp": hostinfo.vpnIp, "indexNumber": hostinfo.localIndexId, "remoteIndexNumber": hostinfo.remoteIndexId}).
-			Debug("Hostmap hostInfo deleted")
+	if final {
+		// I have lost connectivity to my peers. My relay tunnel is likely broken. Mark the next
+		// hops as 'Requested' so that new relay tunnels are created in the future.
+		hm.unlockedDisestablishVpnAddrRelayFor(hostinfo)
 	}
+	// Clean up any local relay indexes for which I am acting as a relay hop
+	for _, localRelayIdx := range hostinfo.relayState.CopyRelayForIdxs() {
+		delete(hm.Relays, localRelayIdx)
+	}
+
+	return final
 }
 
-func (hm *HostMap) QueryIndex(index uint32) (*HostInfo, error) {
-	//TODO: we probably just want ot return bool instead of error, or at least a static error
+func (hm *HostMap) QueryIndexCached(index uint32, cache map[uint32]*HostInfo) *HostInfo {
+	if out, ok := cache[index]; ok {
+		return out
+	}
+	out := hm.QueryIndex(index)
+	if out != nil {
+		cache[index] = out
+	}
+	return out
+}
+
+func (hm *HostMap) QueryIndex(index uint32) *HostInfo {
 	hm.RLock()
 	if h, ok := hm.Indexes[index]; ok {
 		hm.RUnlock()
-		return h, nil
+		return h
 	} else {
 		hm.RUnlock()
-		return nil, errors.New("unable to find index")
+		return nil
 	}
 }
 
-func (hm *HostMap) QueryReverseIndex(index uint32) (*HostInfo, error) {
+func (hm *HostMap) QueryRelayIndex(index uint32) *HostInfo {
+	hm.RLock()
+	if h, ok := hm.Relays[index]; ok {
+		hm.RUnlock()
+		return h
+	} else {
+		hm.RUnlock()
+		return nil
+	}
+}
+
+func (hm *HostMap) QueryReverseIndex(index uint32) *HostInfo {
 	hm.RLock()
 	if h, ok := hm.RemoteIndexes[index]; ok {
 		hm.RUnlock()
-		return h, nil
+		return h
 	} else {
 		hm.RUnlock()
-		return nil, fmt.Errorf("unable to find reverse index or connectionstate nil in %s hostmap", hm.name)
+		return nil
 	}
 }
 
-func (hm *HostMap) QueryVpnIp(vpnIp iputil.VpnIp) (*HostInfo, error) {
-	return hm.queryVpnIp(vpnIp, nil)
+func (hm *HostMap) QueryVpnAddr(vpnIp netip.Addr) *HostInfo {
+	return hm.queryVpnAddr(vpnIp, nil)
 }
 
-// PromoteBestQueryVpnIp will attempt to lazily switch to the best remote every
-// `PromoteEvery` calls to this function for a given host.
-func (hm *HostMap) PromoteBestQueryVpnIp(vpnIp iputil.VpnIp, ifce *Interface) (*HostInfo, error) {
-	return hm.queryVpnIp(vpnIp, ifce)
+func (hm *HostMap) QueryVpnAddrsRelayFor(targetIps []netip.Addr, relayHostIp netip.Addr) (*HostInfo, *Relay, error) {
+	hm.RLock()
+	defer hm.RUnlock()
+
+	// This runs per relayed packet, so check the primary with a single map probe and only consult
+	// moreHosts when the primary can't relay for us.
+	h, ok := hm.Hosts[relayHostIp]
+	if !ok {
+		return nil, nil, errors.New("unable to find host")
+	}
+
+	for _, targetIp := range targetIps {
+		r, ok := h.relayState.QueryRelayForByIp(targetIp)
+		if ok && r.State == Established {
+			return h, r, nil
+		}
+	}
+
+	if list, ok := hm.moreHosts[relayHostIp]; ok {
+		// list[0] is the primary we already checked
+		for _, h := range list[1:] {
+			for _, targetIp := range targetIps {
+				r, ok := h.relayState.QueryRelayForByIp(targetIp)
+				if ok && r.State == Established {
+					return h, r, nil
+				}
+			}
+		}
+	}
+
+	return nil, nil, errors.New("unable to find host with relay")
 }
 
-func (hm *HostMap) queryVpnIp(vpnIp iputil.VpnIp, promoteIfce *Interface) (*HostInfo, error) {
+func (hm *HostMap) unlockedDisestablishVpnAddrRelayFor(hi *HostInfo) {
+	for _, relayHostIp := range hi.relayState.CopyRelayIps() {
+		for _, h := range hm.unlockedGetHostList(relayHostIp) {
+			h.relayState.UpdateRelayForByIpState(hi.vpnAddrs[0], Disestablished)
+		}
+	}
+	for _, rs := range hi.relayState.CopyAllRelayFor() {
+		if rs.Type == ForwardingType {
+			for _, h := range hm.unlockedGetHostList(rs.PeerAddr) {
+				h.relayState.UpdateRelayForByIpState(hi.vpnAddrs[0], Disestablished)
+			}
+		}
+	}
+}
+
+func (hm *HostMap) queryVpnAddr(vpnIp netip.Addr, promoteIfce *Interface) *HostInfo {
 	hm.RLock()
 	if h, ok := hm.Hosts[vpnIp]; ok {
 		hm.RUnlock()
 		// Do not attempt promotion if you are a lighthouse
 		if promoteIfce != nil && !promoteIfce.lightHouse.amLighthouse {
-			h.TryPromoteBest(hm.preferredRanges, promoteIfce)
+			h.TryPromoteBest(hm.GetPreferredRanges(), promoteIfce)
 		}
-		return h, nil
+		return h
 
 	}
 
 	hm.RUnlock()
-	return nil, errors.New("unable to find host")
+	return nil
 }
 
-// We already have the hm Lock when this is called, so make sure to not call
-// any other methods that might try to grab it again
-func (hm *HostMap) addHostInfo(hostinfo *HostInfo, f *Interface) {
-	if f.serveDns {
+// unlockedAddHostInfo assumes you have a write-lock and will add a hostinfo object to the hostmap Indexes and RemoteIndexes maps.
+// If an entry exists for the Hosts table (vpnIp -> hostinfo) then the provided hostinfo will be made primary
+func (hm *HostMap) unlockedAddHostInfo(hostinfo *HostInfo, f *Interface) {
+	if f.dnsServer != nil {
 		remoteCert := hostinfo.ConnectionState.peerCert
-		dnsR.Add(remoteCert.Details.Name+".", remoteCert.Details.Ips[0].IP.String())
+		f.dnsServer.Add(remoteCert.Certificate.Name()+".", hostinfo.vpnAddrs)
+	}
+	for _, addr := range hostinfo.vpnAddrs {
+		hm.unlockedInnerAddHostInfo(addr, hostinfo, f)
 	}
 
-	hm.Hosts[hostinfo.vpnIp] = hostinfo
 	hm.Indexes[hostinfo.localIndexId] = hostinfo
 	hm.RemoteIndexes[hostinfo.remoteIndexId] = hostinfo
 
-	if hm.l.Level >= logrus.DebugLevel {
-		hm.l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": hostinfo.vpnIp, "mapTotalSize": len(hm.Hosts),
-			"hostinfo": m{"existing": true, "localIndexId": hostinfo.localIndexId, "hostId": hostinfo.vpnIp}}).
-			Debug("Hostmap vpnIp added")
+	hostinfo.markOut(f.rebindEpoch.Load())
+	if f.connectionManager != nil { // f.connectionManager is only nil in some unit tests
+		f.connectionManager.trafficTimer.Add(hostinfo.localIndexId, f.connectionManager.checkInterval)
+	}
+
+	if hm.l.Enabled(context.Background(), slog.LevelDebug) {
+		hm.l.Debug("Hostmap vpnIp added",
+			"hostMap", m{"vpnAddrs": hostinfo.vpnAddrs, "mapTotalSize": len(hm.Hosts),
+				"hostinfo": m{"existing": true, "localIndexId": hostinfo.localIndexId, "vpnAddrs": hostinfo.vpnAddrs}},
+		)
 	}
 }
 
-// punchList assembles a list of all non nil RemoteList pointer entries in this hostmap
-// The caller can then do the its work outside of the read lock
-func (hm *HostMap) punchList(rl []*RemoteList) []*RemoteList {
+func (hm *HostMap) unlockedInnerAddHostInfo(vpnAddr netip.Addr, hostinfo *HostInfo, f *Interface) {
+	existing, ok := hm.Hosts[vpnAddr]
+	if !ok {
+		// Common case, the first hostinfo for this address. moreHosts stays empty.
+		hm.Hosts[vpnAddr] = hostinfo
+		return
+	}
+
+	// The new hostinfo becomes the primary for this address. Remove any stale copy of it first so
+	// we never hold a duplicate, then prepend.
+	list, ok := hm.moreHosts[vpnAddr]
+	if !ok {
+		list = []*HostInfo{existing}
+	}
+	list = removeHostInfo(list, hostinfo)
+	list = append([]*HostInfo{hostinfo}, list...)
+	hm.unlockedSetHostsForAddr(vpnAddr, list)
+
+	// Enforce the per-address cap by fully retiring the oldest hostinfo once we exceed it.
+	// Deleting it removes it from all of its addresses and the index maps, matching prior behavior.
+	if len(list) > MaxHostInfosPerVpnIp {
+		hm.unlockedDeleteHostInfo(list[len(list)-1])
+	}
+}
+
+func (hm *HostMap) GetPreferredRanges() []netip.Prefix {
+	//NOTE: if preferredRanges is ever not stored before a load this will fail to dereference a nil pointer
+	return *hm.preferredRanges.Load()
+}
+
+func (hm *HostMap) ForEachVpnAddr(f controlEach) {
 	hm.RLock()
 	defer hm.RUnlock()
 
 	for _, v := range hm.Hosts {
-		if v.remotes != nil {
-			rl = append(rl, v.remotes)
-		}
+		f(v)
 	}
-	return rl
 }
 
-// Punchy iterates through the result of punchList() to assemble all known addresses and sends a hole punch packet to them
-func (hm *HostMap) Punchy(ctx context.Context, conn *udp.Conn) {
-	var metricsTxPunchy metrics.Counter
-	if hm.metricsEnabled {
-		metricsTxPunchy = metrics.GetOrRegisterCounter("messages.tx.punchy", nil)
-	} else {
-		metricsTxPunchy = metrics.NilCounter{}
-	}
+func (hm *HostMap) ForEachIndex(f controlEach) {
+	hm.RLock()
+	defer hm.RUnlock()
 
-	var remotes []*RemoteList
-	b := []byte{1}
-
-	clockSource := time.NewTicker(time.Second * 10)
-	defer clockSource.Stop()
-
-	for {
-		remotes = hm.punchList(remotes[:0])
-		for _, rl := range remotes {
-			//TODO: CopyAddrs generates garbage but ForEach locks for the work here, figure out which way is better
-			for _, addr := range rl.CopyAddrs(hm.preferredRanges) {
-				metricsTxPunchy.Inc(1)
-				conn.WriteTo(b, addr)
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-clockSource.C:
-			continue
-		}
+	for _, v := range hm.Indexes {
+		f(v)
 	}
 }
 
 // TryPromoteBest handles re-querying lighthouses and probing for better paths
 // NOTE: It is an error to call this if you are a lighthouse since they should not roam clients!
-func (i *HostInfo) TryPromoteBest(preferredRanges []*net.IPNet, ifce *Interface) {
-	c := atomic.AddUint32(&i.promoteCounter, 1)
-	if c%PromoteEvery == 0 {
-		// The lock here is currently protecting i.remote access
-		i.RLock()
-		defer i.RUnlock()
+func (i *HostInfo) TryPromoteBest(preferredRanges []netip.Prefix, ifce *Interface) {
+	c := i.promoteCounter.Add(1)
+	if c%ifce.tryPromoteEvery.Load() == 0 {
+		remote := i.GetRemote()
 
 		// return early if we are already on a preferred remote
-		rIP := i.remote.IP
-		for _, l := range preferredRanges {
-			if l.Contains(rIP) {
-				return
+		if remote.IsValid() {
+			rIP := remote.Addr()
+			for _, l := range preferredRanges {
+				if l.Contains(rIP) {
+					return
+				}
 			}
 		}
 
-		i.remotes.ForEach(preferredRanges, func(addr *udp.Addr, preferred bool) {
-			if addr == nil || !preferred {
+		i.remotes.ForEach(preferredRanges, func(addr netip.AddrPort, preferred bool) {
+			if remote.IsValid() && (!addr.IsValid() || !preferred) {
 				return
 			}
 
 			// Try to send a test packet to that host, this should
 			// cause it to detect a roaming event and switch remotes
-			ifce.send(header.Test, header.TestRequest, i.ConnectionState, i, addr, []byte(""), make([]byte, 12, 12), make([]byte, mtu))
+			ifce.sendTo(header.Test, header.TestRequest, i.ConnectionState, i, addr, []byte(""), make([]byte, 12, 12), make([]byte, mtu))
 		})
 	}
 
 	// Re query our lighthouses for new remotes occasionally
-	if c%ReQueryEvery == 0 && ifce.lightHouse != nil {
-		ifce.lightHouse.QueryServer(i.vpnIp, ifce)
-	}
-}
-
-func (i *HostInfo) cachePacket(l *logrus.Logger, t header.MessageType, st header.MessageSubType, packet []byte, f packetCallback, m *cachedPacketMetrics) {
-	//TODO: return the error so we can log with more context
-	if len(i.packetStore) < 100 {
-		tempPacket := make([]byte, len(packet))
-		copy(tempPacket, packet)
-		//l.WithField("trace", string(debug.Stack())).Error("Caching packet", tempPacket)
-		i.packetStore = append(i.packetStore, &cachedPacket{t, st, f, tempPacket})
-		if l.Level >= logrus.DebugLevel {
-			i.logger(l).
-				WithField("length", len(i.packetStore)).
-				WithField("stored", true).
-				Debugf("Packet store")
+	if c%ifce.reQueryEvery.Load() == 0 && ifce.lightHouse != nil {
+		now := time.Now().UnixNano()
+		if now < i.nextLHQuery.Load() {
+			return
 		}
 
-	} else if l.Level >= logrus.DebugLevel {
-		m.dropped.Inc(1)
-		i.logger(l).
-			WithField("length", len(i.packetStore)).
-			WithField("stored", false).
-			Debugf("Packet store")
+		i.nextLHQuery.Store(now + ifce.reQueryWait.Load())
+		ifce.lightHouse.QueryServer(i.vpnAddrs[0])
 	}
 }
 
-// handshakeComplete will set the connection as ready to communicate, as well as flush any stored packets
-func (i *HostInfo) handshakeComplete(l *logrus.Logger, m *cachedPacketMetrics) {
-	//TODO: I'm not certain the distinction between handshake complete and ConnectionState being ready matters because:
-	//TODO: HandshakeComplete means send stored packets and ConnectionState.ready means we are ready to send
-	//TODO: if the transition from HandhsakeComplete to ConnectionState.ready happens all within this function they are identical
+// Bits within HostInfo.state, everything above stateEpochShift is the epoch
+const (
+	stateIn uint32 = 1 << iota
+	stateOut
+	statePendingDeletion
 
-	i.ConnectionState.queueLock.Lock()
-	i.HandshakeComplete = true
-	//TODO: this should be managed by the handshake state machine to set it based on how many handshake were seen.
-	// Clamping it to 2 gets us out of the woods for now
-	atomic.StoreUint64(&i.ConnectionState.atomicMessageCounter, 2)
+	stateFlags = stateIn | stateOut | statePendingDeletion
+	// The epoch is the top 29 bits, it would take 2^29 rebinds to wrap and we will never get there
+	stateEpochShift = 3
+)
 
-	if l.Level >= logrus.DebugLevel {
-		i.logger(l).Debugf("Sending %d stored packets", len(i.packetStore))
+// markIn records inbound traffic
+func (i *HostInfo) markIn() {
+	if i.state.Load()&stateIn == 0 {
+		i.state.Or(stateIn)
 	}
+}
 
-	if len(i.packetStore) > 0 {
-		nb := make([]byte, 12, 12)
-		out := make([]byte, mtu)
-		for _, cp := range i.packetStore {
-			cp.callback(cp.messageType, cp.messageSubType, i, cp.packet, nb, out)
+// markOut records a send and reports whether the epoch moved, meaning we want a punch from the far side
+func (i *HostInfo) markOut(epoch uint32) bool {
+	e := epoch << stateEpochShift
+	for {
+		old := i.state.Load()
+		if old&stateOut != 0 && old&^stateFlags == e {
+			return false
 		}
-		m.sent.Inc(int64(len(i.packetStore)))
-	}
 
-	i.remotes.ResetBlockedRemotes()
-	i.packetStore = make([]*cachedPacket, 0)
-	i.ConnectionState.ready = true
-	i.ConnectionState.queueLock.Unlock()
-	i.ConnectionState.certState = nil
+		if i.state.CompareAndSwap(old, old&stateFlags|stateOut|e) {
+			return old&^stateFlags != e
+		}
+	}
 }
 
-func (i *HostInfo) GetCert() *cert.NebulaCertificate {
+// markOutOnly records a send without consuming the rebind epoch, for paths that cannot act on a requery
+func (i *HostInfo) markOutOnly() {
+	if i.state.Load()&stateOut == 0 {
+		i.state.Or(stateOut)
+	}
+}
+
+// takeTraffic clears both traffic bits, leaving the epoch alone, and reports what they were
+func (i *HostInfo) takeTraffic() (in bool, out bool) {
+	old := i.state.And(^(stateIn | stateOut))
+	return old&stateIn != 0, old&stateOut != 0
+}
+
+func (i *HostInfo) setPendingDeletion(v bool) {
+	if v {
+		i.state.Or(statePendingDeletion)
+	} else {
+		i.state.And(^statePendingDeletion)
+	}
+}
+
+func (i *HostInfo) isPendingDeletion() bool {
+	return i.state.Load()&statePendingDeletion != 0
+}
+
+func (i *HostInfo) GetCert() *cert.CachedCertificate {
 	if i.ConnectionState != nil {
 		return i.ConnectionState.peerCert
 	}
 	return nil
 }
 
-func (i *HostInfo) SetRemote(remote *udp.Addr) {
+func (i *HostInfo) GetRemote() netip.AddrPort {
+	if p := i.remote.Load(); p != nil {
+		return *p
+	}
+	return netip.AddrPort{}
+}
+
+// TODO: Maybe use ViaSender here?
+func (i *HostInfo) SetRemote(remote netip.AddrPort) {
 	// We copy here because we likely got this remote from a source that reuses the object
-	if !i.remote.Equals(remote) {
-		i.remote = remote.Copy()
-		i.remotes.LearnRemote(i.vpnIp, remote.Copy())
+	if i.GetRemote() != remote {
+		i.remote.Store(&remote)
+		i.remotes.LearnRemote(i.vpnAddrs[0], remote)
 	}
 }
 
 // SetRemoteIfPreferred returns true if the remote was changed. The lastRoam
 // time on the HostInfo will also be updated.
-func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote *udp.Addr) bool {
-	currentRemote := i.remote
-	if currentRemote == nil {
-		i.SetRemote(newRemote)
+func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, via ViaSender) bool {
+	if via.IsRelayed {
+		return false
+	}
+
+	currentRemote := i.GetRemote()
+	if !currentRemote.IsValid() {
+		i.SetRemote(via.UdpAddr)
 		return true
 	}
 
 	// NOTE: We do this loop here instead of calling `isPreferred` in
 	// remote_list.go so that we only have to loop over preferredRanges once.
 	newIsPreferred := false
-	for _, l := range hm.preferredRanges {
+	for _, l := range hm.GetPreferredRanges() {
 		// return early if we are already on a preferred remote
-		if l.Contains(currentRemote.IP) {
+		if l.Contains(currentRemote.Addr()) {
 			return false
 		}
 
-		if l.Contains(newRemote.IP) {
+		if l.Contains(via.UdpAddr.Addr()) {
 			newIsPreferred = true
 		}
 	}
@@ -527,9 +877,9 @@ func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote *udp.Addr) bool {
 	if newIsPreferred {
 		// Consider this a roaming event
 		i.lastRoam = time.Now()
-		i.lastRoamRemote = currentRemote.Copy()
+		i.lastRoamRemote = currentRemote
 
-		i.SetRemote(newRemote)
+		i.SetRemote(via.UdpAddr)
 
 		return true
 	}
@@ -537,86 +887,46 @@ func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote *udp.Addr) bool {
 	return false
 }
 
-func (i *HostInfo) RecvErrorExceeded() bool {
-	if i.recvError < 3 {
-		i.recvError += 1
-		return false
+// buildNetworks fills in the networks field of HostInfo. It accepts a cert.Certificate so you never ever mix the network types up.
+func (i *HostInfo) buildNetworks(myVpnNetworksTable *bart.Lite, c cert.Certificate) {
+	if len(c.Networks()) == 1 && len(c.UnsafeNetworks()) == 0 {
+		if myVpnNetworksTable.Contains(c.Networks()[0].Addr()) {
+			return // Simple case, no BART needed
+		}
 	}
-	return true
+
+	i.networks = new(bart.Table[NetworkType])
+	for _, network := range c.Networks() {
+		nprefix := netip.PrefixFrom(network.Addr(), network.Addr().BitLen())
+		if myVpnNetworksTable.Contains(network.Addr()) {
+			i.networks.Insert(nprefix, NetworkTypeVPN)
+		} else {
+			i.networks.Insert(nprefix, NetworkTypeVPNPeer)
+		}
+	}
+
+	for _, network := range c.UnsafeNetworks() {
+		i.networks.Insert(network, NetworkTypeUnsafe)
+	}
 }
 
-func (i *HostInfo) CreateRemoteCIDR(c *cert.NebulaCertificate) {
-	if len(c.Details.Ips) == 1 && len(c.Details.Subnets) == 0 {
-		// Simple case, no CIDRTree needed
-		return
-	}
-
-	remoteCidr := cidr.NewTree4()
-	for _, ip := range c.Details.Ips {
-		remoteCidr.AddCIDR(&net.IPNet{IP: ip.IP, Mask: net.IPMask{255, 255, 255, 255}}, struct{}{})
-	}
-
-	for _, n := range c.Details.Subnets {
-		remoteCidr.AddCIDR(n, struct{}{})
-	}
-	i.remoteCidr = remoteCidr
-}
-
-func (i *HostInfo) logger(l *logrus.Logger) *logrus.Entry {
+// logger returns a derived slog.Logger with per-hostinfo fields pre-bound.
+func (i *HostInfo) logger(l *slog.Logger) *slog.Logger {
 	if i == nil {
-		return logrus.NewEntry(l)
+		return l
 	}
 
-	li := l.WithField("vpnIp", i.vpnIp)
+	li := l.With(
+		"vpnAddrs", i.vpnAddrs,
+		"localIndex", i.localIndexId,
+		"remoteIndex", i.remoteIndexId,
+	)
+
 	if connState := i.ConnectionState; connState != nil {
 		if peerCert := connState.peerCert; peerCert != nil {
-			li = li.WithField("certName", peerCert.Details.Name)
+			li = li.With("certName", peerCert.Certificate.Name())
 		}
 	}
 
 	return li
-}
-
-// Utility functions
-
-func localIps(l *logrus.Logger, allowList *LocalAllowList) *[]net.IP {
-	//FIXME: This function is pretty garbage
-	var ips []net.IP
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		allow := allowList.AllowName(i.Name)
-		if l.Level >= logrus.TraceLevel {
-			l.WithField("interfaceName", i.Name).WithField("allow", allow).Trace("localAllowList.AllowName")
-		}
-
-		if !allow {
-			continue
-		}
-		addrs, _ := i.Addrs()
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				//continue
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-
-			//TODO: Filtering out link local for now, this is probably the most correct thing
-			//TODO: Would be nice to filter out SLAAC MAC based ips as well
-			if ip.IsLoopback() == false && !ip.IsLinkLocalUnicast() {
-				allow := allowList.Allow(ip)
-				if l.Level >= logrus.TraceLevel {
-					l.WithField("localIp", ip).WithField("allow", allow).Trace("localAllowList.Allow")
-				}
-				if !allow {
-					continue
-				}
-
-				ips = append(ips, ip)
-			}
-		}
-	}
-	return &ips
 }

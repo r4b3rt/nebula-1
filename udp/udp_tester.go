@@ -1,80 +1,143 @@
 //go:build e2e_testing
-// +build e2e_testing
 
 package udp
 
 import (
-	"fmt"
-	"net"
+	"context"
+	"io"
+	"log/slog"
+	"net/netip"
+	"os"
+	"sync"
+	"sync/atomic"
 
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/firewall"
 	"github.com/slackhq/nebula/header"
 )
 
 type Packet struct {
-	ToIp     net.IP
-	ToPort   uint16
-	FromIp   net.IP
-	FromPort uint16
-	Data     []byte
+	To   netip.AddrPort
+	From netip.AddrPort
+	Data []byte
 }
 
+// Copy returns a fresh *Packet (from the freelist) with a duplicate Data buffer.
 func (u *Packet) Copy() *Packet {
-	n := &Packet{
-		ToIp:     make(net.IP, len(u.ToIp)),
-		ToPort:   u.ToPort,
-		FromIp:   make(net.IP, len(u.FromIp)),
-		FromPort: u.FromPort,
-		Data:     make([]byte, len(u.Data)),
+	n := acquirePacket()
+	n.To = u.To
+	n.From = u.From
+	if cap(n.Data) < len(u.Data) {
+		n.Data = make([]byte, len(u.Data))
+	} else {
+		n.Data = n.Data[:len(u.Data)]
 	}
-
-	copy(n.ToIp, u.ToIp)
-	copy(n.FromIp, u.FromIp)
 	copy(n.Data, u.Data)
 	return n
 }
 
-type Conn struct {
-	Addr *Addr
+// Release returns p to the harness packet freelist.
+// Callers that pull a *Packet from Get / TxPackets must Release when done.
+// Channel-backed instead of sync.Pool because sync.Pool's per-P caches drain badly under cross-goroutine Get/Put,
+// and putting a []byte in a Pool escapes the slice header to heap.
+func (p *Packet) Release() {
+	if p == nil {
+		return
+	}
+	p.Data = p.Data[:0]
+	select {
+	case packetFreelist <- p:
+	default:
+		// Freelist full; drop the *Packet for the GC.
+	}
+}
+
+// packetFreelist retains *Packet structs (and their backing Data arrays) so steady-state allocation drops to zero.
+var packetFreelist = make(chan *Packet, 64)
+
+func acquirePacket() *Packet {
+	select {
+	case p := <-packetFreelist:
+		return p
+	default:
+		return &Packet{}
+	}
+}
+
+type TesterConn struct {
+	// addr is read by nebula's own goroutines on every send and by the router's flow renderer, and a test can
+	// move it mid-run to simulate roaming, so it is atomic rather than a plain field.
+	addr atomic.Pointer[netip.AddrPort]
 
 	RxPackets chan *Packet // Packets to receive into nebula
 	TxPackets chan *Packet // Packets transmitted outside by nebula
 
-	l *logrus.Logger
+	// done is closed exactly once by Close. Senders select on it so they
+	// never race with a channel close; readers exit when it fires. The
+	// packet channels are intentionally never closed - that was the source
+	// of `send on closed channel` panics when a WriteTo/Send from another
+	// goroutine passed the close check and reached the send just after
+	// Close ran.
+	done      chan struct{}
+	closeOnce sync.Once
+
+	l *slog.Logger
 }
 
-func NewListener(l *logrus.Logger, ip string, port int, _ bool, _ int) (*Conn, error) {
-	return &Conn{
-		Addr:      &Addr{net.ParseIP(ip), uint16(port)},
-		RxPackets: make(chan *Packet, 1),
-		TxPackets: make(chan *Packet, 1),
+func NewListener(l *slog.Logger, s Settings) (Conn, error) {
+	c := &TesterConn{
+		RxPackets: make(chan *Packet, 10),
+		TxPackets: make(chan *Packet, 10),
+		done:      make(chan struct{}),
 		l:         l,
-	}, nil
+	}
+	c.SetAddr(s.Listen)
+	return c, nil
+}
+
+// GetAddr returns the underlay address this conn currently sends from.
+func (u *TesterConn) GetAddr() netip.AddrPort {
+	return *u.addr.Load()
+}
+
+// SetAddr moves this conn to a new underlay address, standing in for a host waking up on a different network.
+func (u *TesterConn) SetAddr(addr netip.AddrPort) {
+	u.addr.Store(&addr)
 }
 
 // Send will place a UdpPacket onto the receive queue for nebula to consume
 // this is an encrypted packet or a handshake message in most cases
 // packets were transmitted from another nebula node, you can send them with Tun.Send
-func (u *Conn) Send(packet *Packet) {
-	h := &header.H{}
-	if err := h.Parse(packet.Data); err != nil {
-		panic(err)
+func (u *TesterConn) Send(packet *Packet) {
+	if u.l.Enabled(context.Background(), slog.LevelDebug) {
+		// Parse the header only under debug logging, otherwise the
+		// allocation would show up in every Send call.
+		var h header.H
+		if err := h.Parse(packet.Data); err != nil {
+			panic(err)
+		}
+		u.l.Debug("UDP receiving injected packet",
+			"header", &h,
+			"udpAddr", packet.From,
+			"dataLen", len(packet.Data),
+		)
 	}
-	u.l.WithField("header", h).
-		WithField("udpAddr", fmt.Sprintf("%v:%v", packet.FromIp, packet.FromPort)).
-		WithField("dataLen", len(packet.Data)).
-		Info("UDP receiving injected packet")
-	u.RxPackets <- packet
+	select {
+	case <-u.done:
+	case u.RxPackets <- packet:
+	}
 }
 
 // Get will pull a UdpPacket from the transmit queue
 // nebula meant to send this message on the network, it will be encrypted
 // packets were ingested from the tun side (in most cases), you can send them with Tun.Send
-func (u *Conn) Get(block bool) *Packet {
+func (u *TesterConn) Get(block bool) *Packet {
 	if block {
-		return <-u.TxPackets
+		select {
+		case <-u.done:
+			return nil
+		case p := <-u.TxPackets:
+			return p
+		}
 	}
 
 	select {
@@ -89,49 +152,73 @@ func (u *Conn) Get(block bool) *Packet {
 // Below this is boilerplate implementation to make nebula actually work
 //********************************************************************************************************************//
 
-func (u *Conn) WriteTo(b []byte, addr *Addr) error {
-	p := &Packet{
-		Data:     make([]byte, len(b), len(b)),
-		FromIp:   make([]byte, 16),
-		FromPort: u.Addr.Port,
-		ToIp:     make([]byte, 16),
-		ToPort:   addr.Port,
+func (u *TesterConn) WriteTo(b []byte, addr netip.AddrPort) error {
+	p := acquirePacket()
+	if cap(p.Data) < len(b) {
+		p.Data = make([]byte, len(b))
+	} else {
+		p.Data = p.Data[:len(b)]
 	}
-
 	copy(p.Data, b)
-	copy(p.ToIp, addr.IP.To16())
-	copy(p.FromIp, u.Addr.IP.To16())
-
-	u.TxPackets <- p
-	return nil
+	p.From = u.GetAddr()
+	p.To = addr
+	select {
+	case <-u.done:
+		p.Release()
+		return io.ErrClosedPipe
+	case u.TxPackets <- p:
+		return nil
+	}
+}
+func (u *TesterConn) WriteBatch(bufs [][]byte, addrs []netip.AddrPort) (int, error) {
+	written := 0
+	for i, b := range bufs {
+		if err := u.WriteTo(b, addrs[i]); err == nil {
+			written++
+		} else {
+			u.l.Debug("failed to write packet in batch", "udpAddr", addrs[i], "error", err)
+		}
+	}
+	return written, nil
 }
 
-func (u *Conn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firewall.ConntrackCacheTicker, q int) {
-	plaintext := make([]byte, MTU)
-	h := &header.H{}
-	fwPacket := &firewall.Packet{}
-	ua := &Addr{IP: make([]byte, 16)}
-	nb := make([]byte, 12, 12)
-
+func (u *TesterConn) ListenOut(r EncReader, flush func()) error {
 	for {
-		p := <-u.RxPackets
-		ua.Port = p.FromPort
-		copy(ua.IP, p.FromIp.To16())
-		r(ua, plaintext[:0], p.Data, h, fwPacket, lhf, nb, q, cache.Get(u.l))
+		select {
+		case <-u.done:
+			return os.ErrClosed
+		case p := <-u.RxPackets:
+			r(p.From, p.Data[:len(p.Data):len(p.Data)])
+			// The batcher borrows plaintext decrypted in place inside p.Data
+			// until Flush, so the packet must stay alive across flush()
+			flush()
+			p.Release()
+		}
 	}
 }
 
-func (u *Conn) ReloadConfig(*config.C) {}
+func (u *TesterConn) ReloadConfig(*config.C, *config.Reload) {}
 
-func NewUDPStatsEmitter(_ []*Conn) func() {
+func NewUDPStatsEmitter(_ []Conn) func() {
 	// No UDP stats for non-linux
 	return func() {}
 }
 
-func (u *Conn) LocalAddr() (*Addr, error) {
-	return u.Addr, nil
+func (u *TesterConn) LocalAddr() (netip.AddrPort, error) {
+	return u.GetAddr(), nil
 }
 
-func (u *Conn) Rebind() error {
+func (u *TesterConn) SupportsMultipleReaders() bool {
+	return false
+}
+
+func (u *TesterConn) Rebind() error {
+	return nil
+}
+
+func (u *TesterConn) Close() error {
+	u.closeOnce.Do(func() {
+		close(u.done)
+	})
 	return nil
 }

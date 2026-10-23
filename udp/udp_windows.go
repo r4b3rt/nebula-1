@@ -1,15 +1,35 @@
 //go:build !e2e_testing
-// +build !e2e_testing
 
 package udp
 
-// Windows support is primarily implemented in udp_generic, besides NewListenConfig
-
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"syscall"
 )
+
+func NewListener(l *slog.Logger, s Settings) (Conn, error) {
+	if s.Multi {
+		//NOTE: Technically we can support it with RIO but it wouldn't be at the socket level
+		// The udp stack would need to be reworked to hide away the implementation differences between
+		// Windows and Linux
+		return nil, fmt.Errorf("multiple udp listeners not supported on windows")
+	}
+
+	var conn Conn
+	rc, err := NewRIOListener(l, s.Listen.Addr(), int(s.Listen.Port()))
+	if err == nil {
+		conn = rc
+	} else {
+		l.Error("Falling back to standard udp sockets", "error", err)
+		conn, err = NewGenericListener(l, s)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return wrapWithWDFBypass(l, conn), nil
+}
 
 func NewListenConfig(multi bool) net.ListenConfig {
 	return net.ListenConfig{
@@ -24,6 +44,6 @@ func NewListenConfig(multi bool) net.ListenConfig {
 	}
 }
 
-func (u *Conn) Rebind() error {
+func (u *GenericConn) Rebind() error {
 	return nil
 }

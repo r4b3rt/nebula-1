@@ -7,14 +7,15 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-//TODO: this can probably move into the header package
-
 type MessageMetrics struct {
 	rx [][]metrics.Counter
 	tx [][]metrics.Counter
 
 	rxUnknown metrics.Counter
 	txUnknown metrics.Counter
+
+	rxInvalid   metrics.Counter
+	txExhausted metrics.Counter
 }
 
 func (m *MessageMetrics) Rx(t header.MessageType, s header.MessageSubType, i int64) {
@@ -33,6 +34,18 @@ func (m *MessageMetrics) Tx(t header.MessageType, s header.MessageSubType, i int
 		} else if m.txUnknown != nil {
 			m.txUnknown.Inc(i)
 		}
+	}
+}
+func (m *MessageMetrics) RxInvalid(i int64) {
+	if m != nil && m.rxInvalid != nil {
+		m.rxInvalid.Inc(i)
+	}
+}
+
+// TxExhausted counts outbound packets dropped because the tunnel's message counter is spent.
+func (m *MessageMetrics) TxExhausted(i int64) {
+	if m != nil && m.txExhausted != nil {
+		m.txExhausted.Inc(i)
 	}
 }
 
@@ -56,8 +69,10 @@ func newMessageMetrics() *MessageMetrics {
 		rx: gen("rx"),
 		tx: gen("tx"),
 
-		rxUnknown: metrics.GetOrRegisterCounter("messages.rx.other", nil),
-		txUnknown: metrics.GetOrRegisterCounter("messages.tx.other", nil),
+		rxUnknown:   metrics.GetOrRegisterCounter("messages.rx.other", nil),
+		txUnknown:   metrics.GetOrRegisterCounter("messages.tx.other", nil),
+		rxInvalid:   metrics.GetOrRegisterCounter("messages.rx.invalid", nil),
+		txExhausted: metrics.GetOrRegisterCounter("messages.tx.exhausted", nil),
 	}
 }
 
@@ -84,6 +99,7 @@ func newLighthouseMetrics() *MessageMetrics {
 			NebulaMeta_HostQueryReply,
 			NebulaMeta_HostUpdateNotification,
 			NebulaMeta_HostPunchNotification,
+			NebulaMeta_HostUpdateNotificationAck,
 		}
 		for _, i := range used {
 			h[i] = []metrics.Counter{metrics.GetOrRegisterCounter(fmt.Sprintf("lighthouse.%s.%s", t, i.String()), nil)}
